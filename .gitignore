@@ -62,8 +62,14 @@ venv.bak/
 # Logs
 *.log
 # SQLite
-*.db
 *.sqlite
+*.db
+!movies.db
+*.db-wal
+*.db-shm
+# Runtime state
+*.pid
+.stats_webapp_url
 # Misc
 /.cache
 /_local
