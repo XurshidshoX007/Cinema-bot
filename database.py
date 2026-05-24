@@ -1,3 +1,4 @@
+import asyncio
 import shutil
 import sqlite3
 import re
@@ -49,7 +50,7 @@ db: aiosqlite.Connection | None = None
 movie_cache: dict[str, tuple[str, str, str, str]] = {}
 serial_group_cache: dict[str, tuple[str, str, str, str]] = {}
 fav_cache: dict[int, set[str]] = {}
-user_activity_cache: dict[int, float] = {}
+user_activity_cache: dict[int, tuple[float, str]] = {}
 view_tracking_exclusion_cache: dict[int, bool] = {}
 channels_cache: list[dict[str, str]] | None = None
 
@@ -263,6 +264,13 @@ def _visible_user_filter(
         f"{base_filter} AND {user_id_column} IN ("
         "SELECT user_id FROM users WHERE COALESCE(is_blocked, 0) = 0"
         ")"
+    )
+
+
+def _base_actor_filter(user_id_column: str = "user_id") -> str:
+    return (
+        f"{user_id_column} != ? "
+        f"AND {user_id_column} NOT IN (SELECT user_id FROM helper_admins)"
     )
 
 
@@ -952,6 +960,9 @@ async def init_db() -> None:
         "CREATE INDEX IF NOT EXISTS idx_users_last_seen ON users(last_seen)"
     )
     await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_users_first_seen ON users(first_seen)"
+    )
+    await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_users_blocked_last_seen ON users(is_blocked, last_seen)"
     )
     await db.execute(
@@ -1170,11 +1181,13 @@ async def touch_user(
     force: bool = False,
 ) -> None:
     now_monotonic = monotonic()
+    today_key = local_now().date().strftime("%Y-%m-%d")
     last_touch = user_activity_cache.get(user_id)
     if (
         not force
         and last_touch is not None
-        and now_monotonic - last_touch < USER_TOUCH_TTL_SECONDS
+        and now_monotonic - last_touch[0] < USER_TOUCH_TTL_SECONDS
+        and last_touch[1] == today_key
     ):
         return
 
@@ -1204,7 +1217,7 @@ async def touch_user(
         await _increment_daily_stat("new_users", connection=connection)
 
     await connection.commit()
-    user_activity_cache[user_id] = now_monotonic
+    user_activity_cache[user_id] = (now_monotonic, today_key)
 
 
 async def mark_user_blocked(
@@ -2387,11 +2400,13 @@ async def get_history_page(user_id: int, limit: int, offset: int = 0) -> list[st
 
 async def add_request(user_id: int, text: str, file_id: str | None) -> None:
     connection = _get_db()
+    should_track_daily_stats = not await _is_view_tracking_excluded(user_id)
     await connection.execute(
         "INSERT INTO requests (user_id, text, file_id) VALUES (?, ?, ?)",
         (user_id, text, file_id),
     )
-    await _increment_daily_stat("requests", connection=connection)
+    if should_track_daily_stats:
+        await _increment_daily_stat("requests", connection=connection)
     await connection.commit()
 
 
@@ -2423,165 +2438,223 @@ async def delete_request(request_id: int) -> None:
     await _execute("DELETE FROM requests WHERE id=?", (request_id,))
 
 
-async def get_dashboard_summary() -> dict[str, int]:
-    connection = _get_db()
+def _open_snapshot_connection() -> sqlite3.Connection:
+    connection = sqlite3.connect(DB_PATH, timeout=5, check_same_thread=False)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def _has_users_block_tracking_sync(connection: sqlite3.Connection) -> bool:
+    try:
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(users)").fetchall()
+            if len(row) > 1
+        }
+    except sqlite3.Error:
+        return False
+    return "is_blocked" in columns
+
+
+def get_dashboard_summary_snapshot() -> dict[str, int]:
+    default_summary = {
+        "total_users": 0,
+        "all_time_users": 0,
+        "entered_today": 0,
+        "new_subscribers_today": 0,
+        "blocked_users": 0,
+        "joined_today": 0,
+        "active_today": 0,
+        "active_week": 0,
+        "total_movies": 0,
+        "total_favorites": 0,
+        "total_views": 0,
+        "total_requests": 0,
+        "pending_requests": 0,
+        "completed_requests": 0,
+        "rejected_requests": 0,
+    }
+    if not DB_PATH.exists():
+        return default_summary
+
     today_start = _format_timestamp(local_day_start_utc())
     today_cutoff = _format_timestamp(_utc_now() - timedelta(days=1))
     week_cutoff = _format_timestamp(local_day_start_utc(6))
-    has_block_tracking = await _ensure_users_tracking_columns(connection)
-    visible_users_filter = _visible_user_filter(
-        has_block_tracking=has_block_tracking,
-        from_users_table=True,
-    )
-    visible_actor_filter = _visible_user_filter(
-        has_block_tracking=has_block_tracking,
-        from_users_table=False,
-    )
 
-    queries = {
-        "total_users": (
-            f"SELECT COUNT(*) FROM users WHERE {visible_users_filter}",
-            (ADMIN_ID,),
-        ),
-        "all_time_users": (
-            "SELECT COUNT(*) FROM users "
-            "WHERE user_id != ? "
-            "AND user_id NOT IN (SELECT user_id FROM helper_admins)",
-            (ADMIN_ID,),
-        ),
-        "entered_today": (
-            "SELECT COUNT(*) FROM users "
-            "WHERE last_seen >= ? "
-            "AND user_id != ? "
-            "AND user_id NOT IN (SELECT user_id FROM helper_admins)",
-            (today_start, ADMIN_ID),
-        ),
-        "new_subscribers_today": (
-            "SELECT COUNT(*) FROM users "
-            "WHERE first_seen >= ? "
-            "AND user_id != ? "
-            "AND user_id NOT IN (SELECT user_id FROM helper_admins)",
-            (today_start, ADMIN_ID),
-        ),
-        "blocked_users": (
-            (
-                "SELECT COUNT(*) FROM users "
-                "WHERE COALESCE(is_blocked, 0) = 1 "
-                "AND user_id != ? "
-                "AND user_id NOT IN (SELECT user_id FROM helper_admins)"
-            )
-            if has_block_tracking
-            else "SELECT 0",
-            (ADMIN_ID,) if has_block_tracking else (),
-        ),
-        "active_today": (
-            f"SELECT COUNT(*) FROM users WHERE last_seen >= ? AND {visible_users_filter}",
-            (today_cutoff, ADMIN_ID),
-        ),
-        "active_week": (
-            f"SELECT COUNT(*) FROM users WHERE last_seen >= ? AND {visible_users_filter}",
-            (week_cutoff, ADMIN_ID),
-        ),
-        "total_movies": ("SELECT COUNT(*) FROM movies", ()),
-        "total_favorites": (
-            f"SELECT COUNT(*) FROM favorites WHERE {visible_actor_filter}",
-            (ADMIN_ID,),
-        ),
-        "total_views": ("SELECT COALESCE(SUM(views), 0) FROM movie_views", ()),
-        "total_requests": (
-            f"SELECT COUNT(*) FROM requests WHERE {visible_actor_filter}",
-            (ADMIN_ID,),
-        ),
-        "pending_requests": (
-            "SELECT COUNT(*) FROM requests "
-            "WHERE status IN ('pending', 'accepted') "
-            f"AND {visible_actor_filter}",
-            (ADMIN_ID,),
-        ),
-        "completed_requests": (
-            "SELECT COUNT(*) FROM requests "
-            "WHERE status='completed' "
-            f"AND {visible_actor_filter}",
-            (ADMIN_ID,),
-        ),
-        "rejected_requests": (
-            "SELECT COUNT(*) FROM requests "
-            "WHERE status='rejected' "
-            f"AND {visible_actor_filter}",
-            (ADMIN_ID,),
-        ),
-    }
+    with _open_snapshot_connection() as connection:
+        has_block_tracking = _has_users_block_tracking_sync(connection)
+        visible_users_filter = _visible_user_filter(
+            has_block_tracking=has_block_tracking,
+            from_users_table=True,
+        )
+        visible_actor_filter = _visible_user_filter(
+            has_block_tracking=has_block_tracking,
+            from_users_table=False,
+        )
+        request_actor_filter = _base_actor_filter()
+        queries = {
+            "total_users": (
+                f"SELECT COUNT(*) FROM users WHERE {visible_users_filter}",
+                (ADMIN_ID,),
+            ),
+            "all_time_users": (
+                f"SELECT COUNT(*) FROM users WHERE {_base_actor_filter()}",
+                (ADMIN_ID,),
+            ),
+            "entered_today": (
+                f"SELECT COUNT(*) FROM users WHERE last_seen >= ? AND {_base_actor_filter()}",
+                (today_start, ADMIN_ID),
+            ),
+            "new_subscribers_today": (
+                f"SELECT COUNT(*) FROM users WHERE first_seen >= ? AND {_base_actor_filter()}",
+                (today_start, ADMIN_ID),
+            ),
+            "blocked_users": (
+                (
+                    "SELECT COUNT(*) FROM users "
+                    "WHERE COALESCE(is_blocked, 0) = 1 "
+                    f"AND {_base_actor_filter()}"
+                )
+                if has_block_tracking
+                else "SELECT 0",
+                (ADMIN_ID,) if has_block_tracking else (),
+            ),
+            "active_today": (
+                f"SELECT COUNT(*) FROM users WHERE last_seen >= ? AND {visible_users_filter}",
+                (today_cutoff, ADMIN_ID),
+            ),
+            "active_week": (
+                f"SELECT COUNT(*) FROM users WHERE last_seen >= ? AND {visible_users_filter}",
+                (week_cutoff, ADMIN_ID),
+            ),
+            "total_movies": ("SELECT COUNT(*) FROM movies", ()),
+            "total_favorites": (
+                f"SELECT COUNT(*) FROM favorites WHERE {visible_actor_filter}",
+                (ADMIN_ID,),
+            ),
+            "total_views": ("SELECT COALESCE(SUM(views), 0) FROM movie_views", ()),
+            "total_requests": (
+                f"SELECT COUNT(*) FROM requests WHERE {request_actor_filter}",
+                (ADMIN_ID,),
+            ),
+            "pending_requests": (
+                "SELECT COUNT(*) FROM requests "
+                "WHERE status IN ('pending', 'accepted') "
+                f"AND {request_actor_filter}",
+                (ADMIN_ID,),
+            ),
+            "completed_requests": (
+                "SELECT COUNT(*) FROM requests "
+                "WHERE status = 'completed' "
+                f"AND {request_actor_filter}",
+                (ADMIN_ID,),
+            ),
+            "rejected_requests": (
+                "SELECT COUNT(*) FROM requests "
+                "WHERE status = 'rejected' "
+                f"AND {request_actor_filter}",
+                (ADMIN_ID,),
+            ),
+        }
 
-    result: dict[str, int] = {}
-    for key, (query, params) in queries.items():
-        async with connection.execute(query, params) as cursor:
-            row = await cursor.fetchone()
-        result[key] = row[0] if row and row[0] is not None else 0
+        result = default_summary.copy()
+        for key, (query, params) in queries.items():
+            row = connection.execute(query, params).fetchone()
+            result[key] = int(row[0] or 0) if row and row[0] is not None else 0
 
-    # Legacy key kept for existing callers that still read joined_today.
     result["joined_today"] = result["entered_today"]
     return result
 
 
-async def get_request_status_counts() -> dict[str, int]:
-    connection = _get_db()
-    has_block_tracking = await _ensure_users_tracking_columns(connection)
-    visible_actor_filter = _visible_user_filter(
-        has_block_tracking=has_block_tracking,
-        from_users_table=False,
-    )
+def get_request_status_counts_snapshot() -> dict[str, int]:
     counts = {
         "pending": 0,
         "accepted": 0,
         "completed": 0,
         "rejected": 0,
     }
+    if not DB_PATH.exists():
+        return counts
 
-    async with connection.execute(
-        """
-        SELECT status, COUNT(*)
-        FROM requests
-        WHERE """
-        + visible_actor_filter
-        + """
-        GROUP BY status
-        """,
-        (ADMIN_ID,),
-    ) as cursor:
-        rows = await cursor.fetchall()
+    with _open_snapshot_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT status, COUNT(*) AS total
+            FROM requests
+            WHERE """
+            + _base_actor_filter()
+            + """
+            GROUP BY status
+            """,
+            (ADMIN_ID,),
+        ).fetchall()
 
-    for status, value in rows:
-        counts[status] = value
-
+    for row in rows:
+        status = str(row["status"] or "").strip().lower()
+        if status in counts:
+            counts[status] = int(row["total"] or 0)
     return counts
 
 
-async def get_daily_metric_series(days: int = 7) -> dict[str, list[int]]:
-    metrics = ("requests", "movie_views", "new_users")
-    labels = _day_keys(days)
-    connection = _get_db()
-    series = {metric: {label: 0 for label in labels} for metric in metrics}
-
-    async with connection.execute(
-        """
-        SELECT day, metric, value
-        FROM daily_stats
-        WHERE day >= ?
-          AND metric IN (?, ?, ?)
-        ORDER BY day ASC
-        """,
-        (labels[0], *metrics),
-    ) as cursor:
-        rows = await cursor.fetchall()
-
-    for day, metric, value in rows:
-        if metric in series and day in series[metric]:
-            series[metric][day] = value
-
-    return {
-        "labels": labels,
-        **{metric: [series[metric][label] for label in labels] for metric in metrics},
+def get_daily_metric_series_snapshot(days: int = 7) -> dict[str, list[int]]:
+    labels = local_day_keys(days)
+    series = {
+        "requests": [0] * days,
+        "movie_views": [0] * days,
+        "new_users": [0] * days,
     }
+    if not DB_PATH.exists():
+        return {"labels": labels, **series}
+
+    with _open_snapshot_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT day, metric, value
+            FROM daily_stats
+            WHERE day >= ?
+              AND metric IN (?, ?)
+            ORDER BY day ASC
+            """,
+            (labels[0], "requests", "movie_views"),
+        ).fetchall()
+        new_user_rows = connection.execute(
+            f"""
+            SELECT SUBSTR(first_seen, 1, 10) AS day, COUNT(*) AS total
+            FROM users
+            WHERE first_seen IS NOT NULL
+              AND SUBSTR(first_seen, 1, 10) >= ?
+              AND {_base_actor_filter()}
+            GROUP BY SUBSTR(first_seen, 1, 10)
+            ORDER BY day ASC
+            """,
+            (labels[0], ADMIN_ID),
+        ).fetchall()
+
+    label_index = {label: index for index, label in enumerate(labels)}
+    for row in rows:
+        day = str(row["day"] or "")
+        metric = str(row["metric"] or "")
+        if day in label_index and metric in series:
+            series[metric][label_index[day]] = int(row["value"] or 0)
+
+    for row in new_user_rows:
+        day = str(row["day"] or "")
+        if day in label_index:
+            series["new_users"][label_index[day]] = int(row["total"] or 0)
+
+    return {"labels": labels, **series}
+
+
+async def get_dashboard_summary() -> dict[str, int]:
+    return await asyncio.to_thread(get_dashboard_summary_snapshot)
+
+
+async def get_request_status_counts() -> dict[str, int]:
+    return await asyncio.to_thread(get_request_status_counts_snapshot)
+
+
+async def get_daily_metric_series(days: int = 7) -> dict[str, list[int]]:
+    return await asyncio.to_thread(get_daily_metric_series_snapshot, days)
 
 
 async def get_top_viewed_movies(limit: int = 5) -> list[tuple[str, str, int, int]]:

@@ -7,7 +7,9 @@ import json
 from pathlib import Path
 import os
 import re
+import socket
 import sqlite3
+import sys
 import time
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse, urlsplit
 from urllib.error import HTTPError, URLError
@@ -22,6 +24,8 @@ from database import (
     APP_TIMEZONE_LABEL,
     DB_PATH,
     format_local_timestamp,
+    get_daily_metric_series_snapshot,
+    get_dashboard_summary_snapshot,
     local_day_keys,
     local_day_start_utc,
     local_now_text,
@@ -38,11 +42,25 @@ PORT = int(os.environ.get("WEBAPP_PORT", "8080"))
 DEEP_LINK_WATCH_PREFIX = "watch_"
 SHARE_MEDIA_ROUTE_PREFIX = "/share-media/"
 SHARE_MEDIA_CACHE_TTL = 600
+DETAIL_ROUTE_PREFIX = "/details/"
+DETAIL_PAGE_SIZE = 50
+MAX_DETAIL_SEARCH_LENGTH = 64
+REQUEST_STATUS_FILTERS = {
+    "all": "Barchasi",
+    "pending-group": "Navbatda",
+    "completed": "Bajarilgan",
+    "rejected": "Rad etilgan",
+}
 _REQUEST_HOST_RE = re.compile(r"^\[?[A-Za-z0-9:.%-]+\]?(?::\d{1,5})?$")
 
 
 class ReusableHTTPServer(HTTPServer):
-    allow_reuse_address = True
+    allow_reuse_address = False
+
+    def server_bind(self) -> None:
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
 
 def _format_number(value: int) -> str:
@@ -376,165 +394,11 @@ def _users_block_filter(conn: sqlite3.Connection) -> str:
 
 
 def _query_summary() -> dict[str, int]:
-    default_summary = {
-        "total_users": 0,
-        "all_time_users": 0,
-        "entered_today": 0,
-        "new_subscribers_today": 0,
-        "blocked_users": 0,
-        "joined_today": 0,
-        "active_today": 0,
-        "active_week": 0,
-        "total_movies": 0,
-        "total_views": 0,
-        "total_requests": 0,
-        "pending_requests": 0,
-        "completed_requests": 0,
-        "rejected_requests": 0,
-    }
-    if not DB_PATH.exists():
-        return default_summary
-
-    today_start = _db_timestamp(local_day_start_utc())
-    today_threshold = _db_timestamp(datetime.now(UTC) - timedelta(days=1))
-    week_threshold = _db_timestamp(local_day_start_utc(6))
-
-    with sqlite3.connect(DB_PATH, timeout=5, check_same_thread=False) as conn:
-        conn.row_factory = sqlite3.Row
-        summary = default_summary.copy()
-        blocked_filter = _users_block_filter(conn)
-
-        cur = conn.execute(
-            "SELECT COUNT(*) as all_time_users, "
-            "SUM(CASE WHEN last_seen >= ? THEN 1 ELSE 0 END) as entered_today "
-            "FROM users "
-            "WHERE user_id != ? "
-            "AND user_id NOT IN (SELECT user_id FROM helper_admins)",
-            (today_start, ADMIN_ID),
-        )
-        row = cur.fetchone()
-        if row:
-            summary["all_time_users"] = int(row["all_time_users"] or 0)
-            summary["entered_today"] = int(row["entered_today"] or 0)
-
-        cur = conn.execute(
-            "SELECT COUNT(*) as new_subscribers_today "
-            "FROM users "
-            "WHERE first_seen >= ? "
-            "AND user_id != ? "
-            "AND user_id NOT IN (SELECT user_id FROM helper_admins)",
-            (today_start, ADMIN_ID),
-        )
-        row = cur.fetchone()
-        if row:
-            summary["new_subscribers_today"] = int(row["new_subscribers_today"] or 0)
-
-        if blocked_filter:
-            cur = conn.execute(
-                "SELECT COUNT(*) as blocked_users "
-                "FROM users "
-                "WHERE COALESCE(is_blocked, 0) = 1 "
-                "AND user_id != ? "
-                "AND user_id NOT IN (SELECT user_id FROM helper_admins)",
-                (ADMIN_ID,),
-            )
-            row = cur.fetchone()
-            if row:
-                summary["blocked_users"] = int(row["blocked_users"] or 0)
-
-        cur = conn.execute(
-            "SELECT COUNT(*) as total_users, "
-            "SUM(CASE WHEN last_seen >= ? THEN 1 ELSE 0 END) as active_today, "
-            "SUM(CASE WHEN last_seen >= ? THEN 1 ELSE 0 END) as active_week "
-            "FROM users "
-            "WHERE user_id != ? "
-            "AND user_id NOT IN (SELECT user_id FROM helper_admins)"
-            f"{blocked_filter}",
-            (today_threshold, week_threshold, ADMIN_ID),
-        )
-        row = cur.fetchone()
-        if row:
-            summary["total_users"] = int(row["total_users"] or 0)
-            summary["active_today"] = int(row["active_today"] or 0)
-            summary["active_week"] = int(row["active_week"] or 0)
-
-        summary["joined_today"] = summary["entered_today"]
-
-        cur = conn.execute("SELECT COUNT(*) as total_movies FROM movies")
-        row = cur.fetchone()
-        if row:
-            summary["total_movies"] = int(row["total_movies"] or 0)
-
-        cur = conn.execute("SELECT SUM(views) as total_views FROM movie_views")
-        row = cur.fetchone()
-        if row:
-            summary["total_views"] = int(row["total_views"] or 0)
-
-        cur = conn.execute(
-            "SELECT COUNT(*) as total_requests, "
-            "SUM(CASE WHEN status IN ('pending', 'accepted') THEN 1 ELSE 0 END) as pending_requests, "
-            "SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_requests, "
-            "SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) as rejected_requests "
-            "FROM requests "
-            "WHERE user_id != ? "
-            "AND user_id NOT IN (SELECT user_id FROM helper_admins)",
-            (ADMIN_ID,),
-        )
-        row = cur.fetchone()
-        if row:
-            summary["total_requests"] = int(row["total_requests"] or 0)
-            summary["pending_requests"] = int(row["pending_requests"] or 0)
-            summary["completed_requests"] = int(row["completed_requests"] or 0)
-            summary["rejected_requests"] = int(row["rejected_requests"] or 0)
-
-    return summary
+    return get_dashboard_summary_snapshot()
 
 
 def _query_daily_series(days: int = 7) -> dict[str, list[int]]:
-    labels = _make_labels(days)
-    series = {
-        "requests": [0] * days,
-        "movie_views": [0] * days,
-        "new_users": [0] * days,
-    }
-    if not DB_PATH.exists():
-        return {"labels": labels, **series}
-
-    placeholders = ",".join("?" for _ in ("requests", "movie_views", "new_users"))
-    query = f"SELECT day, metric, value FROM daily_stats WHERE day >= ? AND metric IN ({placeholders}) ORDER BY day ASC"
-    with sqlite3.connect(DB_PATH, timeout=5, check_same_thread=False) as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            query, (labels[0], "requests", "movie_views", "new_users")
-        ).fetchall()
-        user_rows = conn.execute(
-            f"""
-            SELECT SUBSTR(first_seen, 1, 10) as day, COUNT(*) as total
-            FROM users
-            WHERE first_seen IS NOT NULL
-              AND SUBSTR(first_seen, 1, 10) >= ?
-              AND user_id != ?
-              AND user_id NOT IN (SELECT user_id FROM helper_admins)
-            GROUP BY SUBSTR(first_seen, 1, 10)
-            ORDER BY day ASC
-            """,
-            (labels[0], ADMIN_ID),
-        ).fetchall()
-
-    for row in rows:
-        day = row["day"]
-        metric = row["metric"]
-        value = int(row["value"] or 0)
-        if day in labels and metric in series:
-            index = labels.index(day)
-            series[metric][index] = value
-
-    for row in user_rows:
-        day = row["day"]
-        if day in labels:
-            series["new_users"][labels.index(day)] = int(row["total"] or 0)
-
-    return {"labels": labels, **series}
+    return get_daily_metric_series_snapshot(days)
 
 
 def _query_top_movies(limit: int = 5) -> list[tuple[str, str, int, int]]:
@@ -1111,16 +975,15 @@ def _render_top_movies(movies: list[tuple[str, str, int, int]]) -> str:
     maximum = max(views for _, _, views, _ in movies) or 1
     rows = []
     for index, (code, title, views, unique_views) in enumerate(movies, start=1):
-        safe_title = (
-            title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        )
+        safe_title = escape(title or "Noma'lum kino")
+        safe_code = escape(code or "-")
         w = int((views / maximum) * 100)
         rank_class = f"rank-{index}" if index <= 3 else "rank-other"
 
         rows.append(
             f'<div class="list-item">'
             f'<div class="flex items-center"><div class="rank-badge {rank_class}">{index}</div>'
-            f'<div><div style="font-weight:500; font-size:14px;">{safe_title}</div><div class="text-sm text-dim" style="margin-top:2px;">Kod: {code} • {_format_number(unique_views)} ta unique user</div></div></div>'
+            f'<div><div style="font-weight:500; font-size:14px;">{safe_title}</div><div class="text-sm text-dim" style="margin-top:2px;">Kod: {safe_code} • {_format_number(unique_views)} ta unique user</div></div></div>'
             f'<div style="text-align:right;"><div class="text-sm" style="margin-bottom:4px; font-weight:600; color:var(--primary);">{_format_number(views)} ko&apos;rish</div>'
             f'<div class="progress-bg"><div class="progress-fill" style="width: {max(w, 2)}%"></div></div></div>'
             f"</div>"
@@ -1133,15 +996,17 @@ def _render_recent_users(users: list[tuple[str, str, str]]) -> str:
         return '<div class="text-dim text-sm" style="padding:10px 0;">Ma\'lumot yo\'q.</div>'
     html = ""
     for username, full_name, last_seen in users:
-        ini = username[0].upper() if username else "U"
-        hand = f"@{username}" if username else "anonymous"
+        safe_username = escape(username or "")
+        safe_full_name = escape(full_name or "No-name")
+        ini = escape((username or "U")[0].upper())
+        hand = f"@{safe_username}" if username else "anonymous"
         last_seen_text = format_local_timestamp(last_seen, "%H:%M")
         html += f"""
         <div class="list-item">
             <div class="flex items-center">
                 <div style="width:36px; height:36px; border-radius:50%; background:linear-gradient(135deg, var(--secondary), var(--primary)); display:flex; align-items:center; justify-content:center; margin-right:12px; font-weight:600; color:#fff;">{ini}</div>
                 <div>
-                   <div style="font-weight:500; font-size:14px; max-width: 150px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">{full_name}</div>
+                   <div style="font-weight:500; font-size:14px; max-width: 150px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">{safe_full_name}</div>
                    <div class="text-sm text-dim" style="max-width: 150px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">{hand}</div>
                 </div>
             </div>
@@ -1149,6 +1014,621 @@ def _render_recent_users(users: list[tuple[str, str, str]]) -> str:
         </div>
         """
     return html
+
+
+def _query_dashboard_payload() -> dict[str, object]:
+    return {
+        "summary": _query_summary(),
+        "daily": _query_daily_series(7),
+        "top_movies": _query_top_movies(5),
+        "recent_users": _query_recent_users(6),
+        "updated_at": f"{local_now_text()} {APP_TIMEZONE_LABEL}",
+    }
+
+
+def _normalize_search_text(raw_value: str) -> str:
+    normalized = re.sub(r"\s+", " ", (raw_value or "").strip())
+    return normalized[:MAX_DETAIL_SEARCH_LENGTH].strip()
+
+
+def _parse_page_number(raw_value: str) -> int:
+    try:
+        page = int((raw_value or "").strip() or "1")
+    except ValueError:
+        return 1
+    return max(page, 1)
+
+
+def _pagination_meta(total_count: int, requested_page: int) -> dict[str, int]:
+    total_pages = max(1, (max(total_count, 0) + DETAIL_PAGE_SIZE - 1) // DETAIL_PAGE_SIZE)
+    page = min(max(requested_page, 1), total_pages)
+    offset = (page - 1) * DETAIL_PAGE_SIZE
+    return {
+        "page": page,
+        "page_size": DETAIL_PAGE_SIZE,
+        "total_pages": total_pages,
+        "offset": offset,
+    }
+
+
+def _auth_query_pairs(query: dict[str, list[str]]) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    for key in ("uid", "exp", "sig"):
+        value = _query_value(query, key)
+        if value:
+            pairs.append((key, value))
+    return pairs
+
+
+def _build_url(path: str, pairs: list[tuple[str, str]]) -> str:
+    cleaned_pairs = [(key, value) for key, value in pairs if value]
+    if not cleaned_pairs:
+        return path
+    return f"{path}?{urlencode(cleaned_pairs)}"
+
+
+def _dashboard_href(auth_query: list[tuple[str, str]]) -> str:
+    return _build_url("/", auth_query)
+
+
+def _build_detail_href(
+    metric_key: str,
+    auth_query: list[tuple[str, str]],
+    *,
+    page: int | None = None,
+    q: str | None = None,
+    status: str | None = None,
+) -> str:
+    pairs = list(auth_query)
+    normalized_q = _normalize_search_text(q or "")
+    if status and status in REQUEST_STATUS_FILTERS and status != "all":
+        pairs.append(("status", status))
+    if normalized_q:
+        pairs.append(("q", normalized_q))
+    if page and page > 1:
+        pairs.append(("page", str(page)))
+    return _build_url(f"{DETAIL_ROUTE_PREFIX}{metric_key}", pairs)
+
+
+def _format_detail_timestamp(value: str | None) -> str:
+    normalized = (value or "").strip()
+    if not normalized:
+        return "-"
+    return format_local_timestamp(normalized, "%d.%m.%Y %H:%M")
+
+
+def _escape_like_value(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _build_like_param(value: str) -> str:
+    return f"%{_escape_like_value(value.lower())}%"
+
+
+def _user_search_clause(search_text: str) -> tuple[str, list[str]]:
+    if not search_text:
+        return "", []
+    like_value = _build_like_param(search_text)
+    clause = (
+        " AND (CAST(user_id AS TEXT) LIKE ? ESCAPE '\\' "
+        "OR LOWER(COALESCE(username, '')) LIKE ? ESCAPE '\\' "
+        "OR LOWER(COALESCE(full_name, '')) LIKE ? ESCAPE '\\')"
+    )
+    return clause, [like_value, like_value, like_value]
+
+
+def _request_search_clause(search_text: str) -> tuple[str, list[str]]:
+    if not search_text:
+        return "", []
+    like_value = f"%{_escape_like_value(search_text)}%"
+    clause = (
+        " AND (CAST(r.id AS TEXT) LIKE ? ESCAPE '\\' "
+        "OR CAST(r.user_id AS TEXT) LIKE ? ESCAPE '\\')"
+    )
+    return clause, [like_value, like_value]
+
+
+def _movie_search_clause(search_text: str, title_expr: str) -> tuple[str, list[str]]:
+    if not search_text:
+        return "", []
+    like_value = _build_like_param(search_text)
+    clause = (
+        " AND (LOWER(mv.code) LIKE ? ESCAPE '\\' "
+        f"OR LOWER({title_expr}) LIKE ? ESCAPE '\\')"
+    )
+    return clause, [like_value, like_value]
+
+
+def _render_hidden_inputs(pairs: list[tuple[str, str]]) -> str:
+    return "".join(
+        f'<input type="hidden" name="{escape(key, quote=True)}" value="{escape(value, quote=True)}">'
+        for key, value in pairs
+    )
+
+
+def _render_search_form(
+    *,
+    action_path: str,
+    auth_query: list[tuple[str, str]],
+    current_q: str,
+    placeholder: str,
+    reset_href: str,
+    hidden_pairs: list[tuple[str, str]] | None = None,
+) -> str:
+    hidden_inputs = _render_hidden_inputs(auth_query + list(hidden_pairs or []))
+    return (
+        f'<form class="card search-form" method="get" action="{escape(action_path, quote=True)}">'
+        f"{hidden_inputs}"
+        f'<input type="search" name="q" maxlength="{MAX_DETAIL_SEARCH_LENGTH}" '
+        f'value="{escape(current_q, quote=True)}" placeholder="{escape(placeholder, quote=True)}">'
+        '<button type="submit" class="button">Qidirish</button>'
+        f'<a class="button ghost-button" href="{escape(reset_href, quote=True)}">Tozalash</a>'
+        "</form>"
+    )
+
+
+def _render_stats_strip(items: list[tuple[str, str]]) -> str:
+    if not items:
+        return ""
+    cards = []
+    for label, value in items:
+        cards.append(
+            '<div class="stat-card">'
+            f'<div class="stat-label">{escape(label)}</div>'
+            f'<div class="stat-value">{escape(value)}</div>'
+            "</div>"
+        )
+    return f'<div class="stats-strip">{"".join(cards)}</div>'
+
+
+def _render_empty_card(message: str) -> str:
+    return (
+        '<div class="card empty-card">'
+        f"<p>{escape(message)}</p>"
+        "</div>"
+    )
+
+
+def _render_table_card(
+    headers: list[str],
+    rows_html: list[str],
+    *,
+    empty_message: str,
+    min_width: int = 760,
+) -> str:
+    if not rows_html:
+        return _render_empty_card(empty_message)
+    head_html = "".join(f"<th>{escape(header)}</th>" for header in headers)
+    return (
+        '<div class="card table-card">'
+        f'<div class="table-wrap"><table style="min-width:{min_width}px">'
+        f"<thead><tr>{head_html}</tr></thead>"
+        f"<tbody>{''.join(rows_html)}</tbody>"
+        "</table></div></div>"
+    )
+
+
+def _render_pagination(
+    metric_key: str,
+    auth_query: list[tuple[str, str]],
+    *,
+    page: int,
+    total_pages: int,
+    q: str = "",
+    status: str = "all",
+) -> str:
+    if total_pages <= 1:
+        return ""
+
+    page_links = []
+    start_page = max(1, page - 2)
+    end_page = min(total_pages, page + 2)
+    for candidate in range(start_page, end_page + 1):
+        href = _build_detail_href(metric_key, auth_query, page=candidate, q=q, status=status)
+        class_name = "pager-link active" if candidate == page else "pager-link"
+        page_links.append(
+            f'<a class="{class_name}" href="{escape(href, quote=True)}">{candidate}</a>'
+        )
+
+    prev_html = '<span class="pager-link disabled">Oldingi</span>'
+    if page > 1:
+        prev_href = _build_detail_href(metric_key, auth_query, page=page - 1, q=q, status=status)
+        prev_html = f'<a class="pager-link" href="{escape(prev_href, quote=True)}">Oldingi</a>'
+
+    next_html = '<span class="pager-link disabled">Keyingi</span>'
+    if page < total_pages:
+        next_href = _build_detail_href(metric_key, auth_query, page=page + 1, q=q, status=status)
+        next_html = f'<a class="pager-link" href="{escape(next_href, quote=True)}">Keyingi</a>'
+
+    return (
+        '<div class="card pager">'
+        f'<div class="pager-meta">Sahifa {page} / {total_pages}</div>'
+        f'<div class="pager-links">{prev_html}{"".join(page_links)}{next_html}</div>'
+        "</div>"
+    )
+
+
+def _build_detail_shell(
+    *,
+    title: str,
+    description: str,
+    body_html: str,
+    auth_query: list[tuple[str, str]],
+) -> str:
+    updated_at = f"{local_now_text()} {APP_TIMEZONE_LABEL}"
+    back_href = _dashboard_href(auth_query)
+    return f"""<!DOCTYPE html>
+<html lang="uz">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>{escape(title)} | Admin Analytiq</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {{
+            --bg: #090e17;
+            --surface: #121826;
+            --surface-hover: #1a2235;
+            --primary: #38bdf8;
+            --secondary: #818cf8;
+            --accent: #f43f5e;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --border: #1e293b;
+        }}
+        * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: 'Outfit', sans-serif; }}
+        body {{ background: var(--bg); color: var(--text-main); -webkit-font-smoothing: antialiased; }}
+        .container {{ max-width: 1180px; margin: 0 auto; padding: 24px 20px 40px; }}
+        .page-header {{ display: flex; justify-content: space-between; gap: 20px; flex-wrap: wrap; margin-bottom: 24px; }}
+        .page-header h1 {{ font-size: 28px; margin: 10px 0 6px; }}
+        .page-header p {{ color: var(--text-muted); line-height: 1.55; max-width: 760px; }}
+        .back-link {{ display: inline-flex; align-items: center; gap: 8px; color: var(--primary); text-decoration: none; font-weight: 600; }}
+        .back-link:hover {{ text-decoration: underline; }}
+        .live-status {{ display: inline-flex; align-items: center; gap: 6px; background: rgba(16, 185, 129, 0.15); border: 1px solid rgba(16, 185, 129, 0.3); padding: 8px 12px; border-radius: 999px; color: var(--success); font-size: 12px; font-weight: 600; letter-spacing: 0.4px; height: fit-content; }}
+        .card {{ background: var(--surface); border: 1px solid var(--border); border-radius: 18px; padding: 18px; }}
+        .stats-strip {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 18px; }}
+        .stat-card {{ background: linear-gradient(180deg, rgba(255,255,255,0.03) 0%, transparent 100%); border: 1px solid rgba(255,255,255,0.04); border-radius: 14px; padding: 16px; }}
+        .stat-label {{ color: var(--text-muted); font-size: 13px; text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 8px; }}
+        .stat-value {{ color: var(--text-main); font-size: 24px; font-weight: 700; line-height: 1.15; }}
+        .search-form {{ display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-bottom: 18px; }}
+        .search-form input {{ flex: 1 1 260px; min-width: 220px; border-radius: 12px; border: 1px solid var(--border); background: rgba(255,255,255,0.03); color: var(--text-main); padding: 12px 14px; outline: none; }}
+        .search-form input::placeholder {{ color: var(--text-muted); }}
+        .button {{ display: inline-flex; align-items: center; justify-content: center; border-radius: 12px; padding: 11px 16px; border: 1px solid transparent; background: var(--primary); color: #08121d; text-decoration: none; font-weight: 700; cursor: pointer; }}
+        .ghost-button {{ background: transparent; color: var(--text-main); border-color: var(--border); }}
+        .status-tabs {{ display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 18px; }}
+        .status-tab {{ display: inline-flex; align-items: center; gap: 8px; padding: 10px 14px; border-radius: 999px; border: 1px solid var(--border); background: rgba(255,255,255,0.02); color: var(--text-main); text-decoration: none; }}
+        .status-tab.active {{ border-color: rgba(56, 189, 248, 0.55); background: rgba(56, 189, 248, 0.12); color: var(--primary); }}
+        .table-card {{ padding: 0; overflow: hidden; }}
+        .table-wrap {{ overflow-x: auto; }}
+        table {{ width: 100%; border-collapse: collapse; }}
+        th, td {{ padding: 14px 16px; text-align: left; vertical-align: top; border-bottom: 1px solid rgba(255,255,255,0.06); }}
+        th {{ color: var(--text-muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.45px; background: rgba(255,255,255,0.02); }}
+        td {{ font-size: 14px; line-height: 1.5; }}
+        tbody tr:hover {{ background: rgba(255,255,255,0.02); }}
+        .muted {{ color: var(--text-muted); }}
+        .badge {{ display: inline-flex; align-items: center; padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; }}
+        .badge-success {{ background: rgba(16, 185, 129, 0.14); color: var(--success); }}
+        .badge-warning {{ background: rgba(245, 158, 11, 0.15); color: var(--warning); }}
+        .badge-accent {{ background: rgba(244, 63, 94, 0.14); color: var(--accent); }}
+        .badge-neutral {{ background: rgba(148, 163, 184, 0.14); color: #cbd5e1; }}
+        .pager {{ display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; align-items: center; margin-top: 18px; }}
+        .pager-meta {{ color: var(--text-muted); font-size: 13px; }}
+        .pager-links {{ display: flex; gap: 8px; flex-wrap: wrap; }}
+        .pager-link {{ display: inline-flex; align-items: center; justify-content: center; min-width: 40px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border); background: rgba(255,255,255,0.02); color: var(--text-main); text-decoration: none; }}
+        .pager-link.active {{ border-color: rgba(56, 189, 248, 0.55); color: var(--primary); background: rgba(56, 189, 248, 0.1); }}
+        .pager-link.disabled {{ opacity: 0.45; pointer-events: none; }}
+        .empty-card {{ text-align: center; color: var(--text-muted); padding: 32px 20px; }}
+        .note-card {{ margin-bottom: 18px; color: var(--text-muted); line-height: 1.6; }}
+        .chart {{ display: flex; align-items: flex-end; gap: 8px; height: 200px; margin-top: 18px; }}
+        .chart-col {{ flex: 1; min-width: 0; height: 100%; display: flex; flex-direction: column; justify-content: flex-end; align-items: center; gap: 8px; }}
+        .chart-value {{ min-height: 14px; font-size: 11px; color: var(--text-muted); line-height: 1; }}
+        .bar-wrap {{ width: 100%; height: 130px; background: rgba(255,255,255,0.03); border-radius: 4px; display: flex; align-items: flex-end; overflow: hidden; }}
+        .bar {{ width: 100%; display: block; border-radius: 4px 4px 0 0; transform-origin: bottom; animation: fillBar 0.8s ease-out forwards; }}
+        .chart-label {{ font-size: 11px; color: var(--text-muted); }}
+        .inline-link {{ color: var(--primary); text-decoration: none; font-weight: 600; }}
+        .inline-link:hover {{ text-decoration: underline; }}
+        @keyframes fillBar {{ from {{ transform: scaleY(0); }} to {{ transform: scaleY(1); }} }}
+        @media (max-width: 768px) {{
+            .container {{ padding: 18px 14px 32px; }}
+            .page-header h1 {{ font-size: 24px; }}
+            .search-form {{ flex-direction: column; align-items: stretch; }}
+            .search-form input {{ width: 100%; }}
+            .button, .ghost-button {{ width: 100%; }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header class="page-header">
+            <div>
+                <a class="back-link" href="{escape(back_href, quote=True)}">&larr; Dashboardga qaytish</a>
+                <h1>{escape(title)}</h1>
+                <p>{escape(description)}</p>
+            </div>
+            <div class="live-status">Yangilandi: {escape(updated_at)}</div>
+        </header>
+        {body_html}
+    </div>
+</body>
+</html>"""
+
+
+def _query_users_detail_page(
+    *,
+    include_blocked: bool,
+    blocked_only: bool,
+    last_seen_since: str | None,
+    first_seen_since: str | None,
+    order_by: str,
+    search_text: str,
+    page: int,
+) -> dict[str, object]:
+    empty_page = {
+        "total_count": 0,
+        "page": 1,
+        "page_size": DETAIL_PAGE_SIZE,
+        "total_pages": 1,
+        "rows": [],
+    }
+    if not DB_PATH.exists():
+        return empty_page
+
+    with sqlite3.connect(DB_PATH, timeout=5, check_same_thread=False) as conn:
+        conn.row_factory = sqlite3.Row
+        user_columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(users)").fetchall()
+            if len(row) > 1
+        }
+        has_block_tracking = "is_blocked" in user_columns
+        has_blocked_at = "blocked_at" in user_columns
+        if blocked_only and not has_block_tracking:
+            return empty_page
+
+        where_parts = [
+            "user_id != ?",
+            "user_id NOT IN (SELECT user_id FROM helper_admins)",
+        ]
+        params: list[object] = [ADMIN_ID]
+
+        if blocked_only:
+            where_parts.append("COALESCE(is_blocked, 0) = 1")
+        elif has_block_tracking and not include_blocked:
+            where_parts.append("COALESCE(is_blocked, 0) = 0")
+
+        if last_seen_since:
+            where_parts.append("COALESCE(last_seen, '') >= ?")
+            params.append(last_seen_since)
+        if first_seen_since:
+            where_parts.append("COALESCE(first_seen, '') >= ?")
+            params.append(first_seen_since)
+
+        search_clause, search_params = _user_search_clause(search_text)
+        where_sql = " AND ".join(where_parts) + search_clause
+        params.extend(search_params)
+
+        total_row = conn.execute(
+            f"SELECT COUNT(*) AS total_count FROM users WHERE {where_sql}",
+            tuple(params),
+        ).fetchone()
+        total_count = int(total_row["total_count"] or 0) if total_row else 0
+        page_meta = _pagination_meta(total_count, page)
+
+        if has_block_tracking:
+            blocked_at_expr = "COALESCE(blocked_at, '')" if has_blocked_at else "''"
+            status_select = (
+                f"COALESCE(is_blocked, 0) AS is_blocked, {blocked_at_expr} AS blocked_at"
+            )
+        else:
+            status_select = "0 AS is_blocked, '' AS blocked_at"
+
+        rows = conn.execute(
+            f"""
+            SELECT
+                user_id,
+                COALESCE(username, '') AS username,
+                COALESCE(full_name, '') AS full_name,
+                COALESCE(first_seen, '') AS first_seen,
+                COALESCE(last_seen, '') AS last_seen,
+                {status_select}
+            FROM users
+            WHERE {where_sql}
+            ORDER BY {order_by}
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [DETAIL_PAGE_SIZE, page_meta["offset"]]),
+        ).fetchall()
+
+    return {
+        "total_count": total_count,
+        "page": page_meta["page"],
+        "page_size": DETAIL_PAGE_SIZE,
+        "total_pages": page_meta["total_pages"],
+        "rows": rows,
+    }
+
+
+def _query_requests_detail_page(
+    *,
+    search_text: str,
+    page: int,
+    status_filter: str,
+) -> dict[str, object]:
+    empty_page = {
+        "total_count": 0,
+        "page": 1,
+        "page_size": DETAIL_PAGE_SIZE,
+        "total_pages": 1,
+        "rows": [],
+    }
+    if not DB_PATH.exists():
+        return empty_page
+
+    with sqlite3.connect(DB_PATH, timeout=5, check_same_thread=False) as conn:
+        conn.row_factory = sqlite3.Row
+        where_parts = [
+            "r.user_id != ?",
+            "r.user_id NOT IN (SELECT user_id FROM helper_admins)",
+        ]
+        params: list[object] = [ADMIN_ID]
+        if status_filter == "pending-group":
+            where_parts.append("r.status IN ('pending', 'accepted')")
+        elif status_filter == "completed":
+            where_parts.append("r.status = 'completed'")
+        elif status_filter == "rejected":
+            where_parts.append("r.status = 'rejected'")
+
+        search_clause, search_params = _request_search_clause(search_text)
+        where_sql = " AND ".join(where_parts) + search_clause
+        params.extend(search_params)
+
+        total_row = conn.execute(
+            f"SELECT COUNT(*) AS total_count FROM requests r WHERE {where_sql}",
+            tuple(params),
+        ).fetchone()
+        total_count = int(total_row["total_count"] or 0) if total_row else 0
+        page_meta = _pagination_meta(total_count, page)
+
+        rows = conn.execute(
+            f"""
+            SELECT
+                r.id,
+                r.user_id,
+                COALESCE(r.text, '') AS text,
+                COALESCE(r.file_id, '') AS file_id,
+                COALESCE(r.status, 'pending') AS status,
+                COALESCE(u.username, '') AS username,
+                COALESCE(u.full_name, '') AS full_name
+            FROM requests r
+            LEFT JOIN users u ON u.user_id = r.user_id
+            WHERE {where_sql}
+            ORDER BY r.id DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [DETAIL_PAGE_SIZE, page_meta["offset"]]),
+        ).fetchall()
+
+    return {
+        "total_count": total_count,
+        "page": page_meta["page"],
+        "page_size": DETAIL_PAGE_SIZE,
+        "total_pages": page_meta["total_pages"],
+        "rows": rows,
+    }
+
+
+def _query_top_movies_detail_page(
+    *,
+    search_text: str,
+    page: int,
+) -> dict[str, object]:
+    empty_page = {
+        "total_count": 0,
+        "page": 1,
+        "page_size": DETAIL_PAGE_SIZE,
+        "total_pages": 1,
+        "rows": [],
+    }
+    if not DB_PATH.exists():
+        return empty_page
+
+    with sqlite3.connect(DB_PATH, timeout=5, check_same_thread=False) as conn:
+        conn.row_factory = sqlite3.Row
+        movie_view_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(movie_views)").fetchall()
+        }
+        unique_views_expr = (
+            "COALESCE(mv.unique_views, mv.views)"
+            if "unique_views" in movie_view_columns
+            else "mv.views"
+        )
+        title_expr = (
+            "CASE "
+            "WHEN COALESCE(m.content_kind, 'movie') = 'serial' "
+            "AND COALESCE(m.episode_number, 0) > 0 "
+            "THEN COALESCE(NULLIF(m.series_title, ''), m.title) || ' ' || m.episode_number || '-qism' "
+            "ELSE COALESCE(m.title, 'Noma''lum kino') "
+            "END"
+        )
+        search_clause, search_params = _movie_search_clause(search_text, title_expr)
+
+        total_row = conn.execute(
+            f"""
+            SELECT COUNT(*) AS total_count
+            FROM movie_views mv
+            LEFT JOIN movies m ON m.code = mv.code
+            WHERE 1 = 1 {search_clause}
+            """,
+            tuple(search_params),
+        ).fetchone()
+        total_count = int(total_row["total_count"] or 0) if total_row else 0
+        page_meta = _pagination_meta(total_count, page)
+
+        rows = conn.execute(
+            f"""
+            SELECT
+                mv.code,
+                {title_expr} AS display_title,
+                COALESCE(mv.views, 0) AS views,
+                {unique_views_expr} AS unique_views,
+                COALESCE(mv.last_viewed_at, '') AS last_viewed_at
+            FROM movie_views mv
+            LEFT JOIN movies m ON m.code = mv.code
+            WHERE 1 = 1 {search_clause}
+            ORDER BY
+                views DESC,
+                unique_views DESC,
+                last_viewed_at DESC,
+                mv.code ASC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(search_params + [DETAIL_PAGE_SIZE, page_meta["offset"]]),
+        ).fetchall()
+
+    return {
+        "total_count": total_count,
+        "page": page_meta["page"],
+        "page_size": DETAIL_PAGE_SIZE,
+        "total_pages": page_meta["total_pages"],
+        "rows": rows,
+    }
+
+
+def _short_text(value: str, limit: int = 120) -> str:
+    compact = re.sub(r"\s+", " ", (value or "").strip())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3].rstrip() + "..."
+
+
+def _render_request_tabs(
+    *,
+    auth_query: list[tuple[str, str]],
+    current_status: str,
+    current_q: str,
+    counts: dict[str, int],
+) -> str:
+    items = [
+        ("all", REQUEST_STATUS_FILTERS["all"], counts.get("all", 0)),
+        ("pending-group", REQUEST_STATUS_FILTERS["pending-group"], counts.get("pending-group", 0)),
+        ("completed", REQUEST_STATUS_FILTERS["completed"], counts.get("completed", 0)),
+        ("rejected", REQUEST_STATUS_FILTERS["rejected"], counts.get("rejected", 0)),
+    ]
+    links = []
+    for status_key, label, count in items:
+        href = _build_detail_href(
+            "requests-overview",
+            auth_query,
+            q=current_q,
+            status=status_key,
+        )
+        class_name = "status-tab active" if current_status == status_key else "status-tab"
+        links.append(
+            f'<a class="{class_name}" href="{escape(href, quote=True)}">{escape(label)} <span class="muted">{_format_number(count)}</span></a>'
+        )
+    return f'<div class="status-tabs">{"".join(links)}</div>'
 
 
 def _build_page() -> str:
@@ -1412,8 +1892,648 @@ def _build_page() -> str:
         recent_users_html=_render_recent_users(recent_users),
     )
 
+def _build_user_detail_page(
+    metric_key: str,
+    auth_query: list[tuple[str, str]],
+    query: dict[str, list[str]],
+    config: dict[str, object],
+) -> str:
+    search_text = _normalize_search_text(_query_value(query, "q"))
+    requested_page = _parse_page_number(_query_value(query, "page"))
+    page_data = _query_users_detail_page(
+        include_blocked=bool(config["include_blocked"]),
+        blocked_only=bool(config["blocked_only"]),
+        last_seen_since=str(config["last_seen_since"] or "") or None,
+        first_seen_since=str(config["first_seen_since"] or "") or None,
+        order_by=str(config["order_by"]),
+        search_text=search_text,
+        page=requested_page,
+    )
 
-_cache = {"data": b"", "timestamp": 0}
+    stats = [
+        ("Jami", _format_number(int(page_data["total_count"]))),
+        ("Sahifa", f"{page_data['page']} / {page_data['total_pages']}"),
+    ]
+    if search_text:
+        stats.append(("Qidiruv", search_text))
+    if metric_key == "active-24h":
+        summary = _query_summary()
+        stats.append(("7 kun faol", _format_number(summary["active_week"])))
+
+    rows_html = []
+    for row in page_data["rows"]:
+        username = str(row["username"] or "").strip()
+        full_name = str(row["full_name"] or "").strip() or f"User {row['user_id']}"
+        status_badge = (
+            '<span class="badge badge-accent">Bloklangan</span>'
+            if int(row["is_blocked"] or 0)
+            else '<span class="badge badge-success">Faol</span>'
+        )
+        rows_html.append(
+            "<tr>"
+            f"<td>{int(row['user_id'])}</td>"
+            f"<td>{escape(full_name)}</td>"
+            f"<td>{escape(f'@{username}' if username else '-')}</td>"
+            f"<td>{escape(_format_detail_timestamp(row['first_seen']))}</td>"
+            f"<td>{escape(_format_detail_timestamp(row['last_seen']))}</td>"
+            f"<td>{status_badge}</td>"
+            f"<td>{escape(_format_detail_timestamp(row['blocked_at']))}</td>"
+            "</tr>"
+        )
+
+    body_html = _render_stats_strip(stats)
+    body_html += _render_search_form(
+        action_path=f"{DETAIL_ROUTE_PREFIX}{metric_key}",
+        auth_query=auth_query,
+        current_q=search_text,
+        placeholder="ID, username yoki ism bo'yicha qidiring",
+        reset_href=_build_detail_href(metric_key, auth_query),
+    )
+    if config.get("note"):
+        body_html += f'<div class="card note-card"><p>{escape(str(config["note"]))}</p></div>'
+    body_html += _render_table_card(
+        ["User ID", "Ism", "Username", "Birinchi kirgan", "Oxirgi faollik", "Holat", "Blok vaqti"],
+        rows_html,
+        empty_message="Bu filtr bo'yicha foydalanuvchi topilmadi.",
+        min_width=920,
+    )
+    body_html += _render_pagination(
+        metric_key,
+        auth_query,
+        page=int(page_data["page"]),
+        total_pages=int(page_data["total_pages"]),
+        q=search_text,
+    )
+    return _build_detail_shell(
+        title=str(config["title"]),
+        description=str(config["description"]),
+        body_html=body_html,
+        auth_query=auth_query,
+    )
+
+
+def _build_requests_overview_page(
+    auth_query: list[tuple[str, str]],
+    query: dict[str, list[str]],
+) -> str:
+    status_filter = _query_value(query, "status")
+    if status_filter not in REQUEST_STATUS_FILTERS:
+        status_filter = "all"
+    search_text = _normalize_search_text(_query_value(query, "q"))
+    requested_page = _parse_page_number(_query_value(query, "page"))
+    page_data = _query_requests_detail_page(
+        search_text=search_text,
+        page=requested_page,
+        status_filter=status_filter,
+    )
+    summary = _query_summary()
+    counts = {
+        "all": summary["total_requests"],
+        "pending-group": summary["pending_requests"],
+        "completed": summary["completed_requests"],
+        "rejected": summary["rejected_requests"],
+    }
+
+    stats = [
+        ("Jami", _format_number(summary["total_requests"])),
+        ("Ko'rsatilgan", _format_number(int(page_data["total_count"]))),
+        ("Status", REQUEST_STATUS_FILTERS[status_filter]),
+    ]
+    if search_text:
+        stats.append(("Qidiruv", search_text))
+
+    rows_html = []
+    for row in page_data["rows"]:
+        full_name = str(row["full_name"] or "").strip() or f"User {row['user_id']}"
+        username = str(row["username"] or "").strip()
+        status_value = str(row["status"] or "pending").strip().lower()
+        if status_value == "completed":
+            badge = '<span class="badge badge-success">completed</span>'
+        elif status_value == "rejected":
+            badge = '<span class="badge badge-accent">rejected</span>'
+        elif status_value == "accepted":
+            badge = '<span class="badge badge-neutral">accepted</span>'
+        else:
+            badge = '<span class="badge badge-warning">pending</span>'
+        file_label = "Bor" if str(row["file_id"] or "").strip() else "Yo'q"
+        rows_html.append(
+            "<tr>"
+            f"<td>{int(row['id'])}</td>"
+            f"<td><strong>{escape(full_name)}</strong><br><span class=\"muted\">{escape(f'@{username}' if username else '-')}</span><br><span class=\"muted\">ID: {int(row['user_id'])}</span></td>"
+            f"<td>{badge}</td>"
+            f"<td>{escape(_short_text(str(row['text'] or '-')) or '-')}</td>"
+            f"<td>{escape(file_label)}</td>"
+            "</tr>"
+        )
+
+    body_html = _render_stats_strip(stats)
+    body_html += _render_request_tabs(
+        auth_query=auth_query,
+        current_status=status_filter,
+        current_q=search_text,
+        counts=counts,
+    )
+    body_html += _render_search_form(
+        action_path=f"{DETAIL_ROUTE_PREFIX}requests-overview",
+        auth_query=auth_query,
+        current_q=search_text,
+        placeholder="Request ID yoki user ID bo'yicha qidiring",
+        reset_href=_build_detail_href("requests-overview", auth_query, status=status_filter),
+        hidden_pairs=[] if status_filter == "all" else [("status", status_filter)],
+    )
+    body_html += _render_table_card(
+        ["Request ID", "Foydalanuvchi", "Raw status", "Matn", "Fayl"],
+        rows_html,
+        empty_message="Bu filtr bo'yicha request topilmadi.",
+        min_width=860,
+    )
+    body_html += _render_pagination(
+        "requests-overview",
+        auth_query,
+        page=int(page_data["page"]),
+        total_pages=int(page_data["total_pages"]),
+        q=search_text,
+        status=status_filter,
+    )
+    return _build_detail_shell(
+        title="So'rovlar overview",
+        description="Requestlar ro'yxati status va qidiruv filtrlari bilan. pending-group filtri pending va accepted yozuvlarni birga ko'rsatadi.",
+        body_html=body_html,
+        auth_query=auth_query,
+    )
+
+
+def _build_top_movies_detail_page(
+    auth_query: list[tuple[str, str]],
+    query: dict[str, list[str]],
+) -> str:
+    search_text = _normalize_search_text(_query_value(query, "q"))
+    requested_page = _parse_page_number(_query_value(query, "page"))
+    page_data = _query_top_movies_detail_page(search_text=search_text, page=requested_page)
+    summary = _query_summary()
+
+    stats = [
+        ("Jami kino", _format_number(int(page_data["total_count"]))),
+        ("Ko'rishlar jami", _format_number(summary["total_views"])),
+        ("Sahifa", f"{page_data['page']} / {page_data['total_pages']}"),
+    ]
+    if search_text:
+        stats.append(("Qidiruv", search_text))
+
+    rows_html = []
+    rank_offset = (int(page_data["page"]) - 1) * DETAIL_PAGE_SIZE
+    for index, row in enumerate(page_data["rows"], start=1):
+        display_title = str(row["display_title"] or "Noma'lum kino")
+        rows_html.append(
+            "<tr>"
+            f"<td>{rank_offset + index}</td>"
+            f"<td>{escape(str(row['code'] or '-'))}</td>"
+            f"<td>{escape(display_title)}</td>"
+            f"<td>{_format_number(int(row['views'] or 0))}</td>"
+            f"<td>{_format_number(int(row['unique_views'] or 0))}</td>"
+            f"<td>{escape(_format_detail_timestamp(row['last_viewed_at']))}</td>"
+            "</tr>"
+        )
+
+    body_html = _render_stats_strip(stats)
+    body_html += _render_search_form(
+        action_path=f"{DETAIL_ROUTE_PREFIX}top-movies",
+        auth_query=auth_query,
+        current_q=search_text,
+        placeholder="Kod yoki nom bo'yicha qidiring",
+        reset_href=_build_detail_href("top-movies", auth_query),
+    )
+    body_html += _render_table_card(
+        ["#", "Kod", "Nomi", "Ko'rishlar", "Unique user", "Oxirgi ko'rilgan"],
+        rows_html,
+        empty_message="Bu filtr bo'yicha kino topilmadi.",
+        min_width=860,
+    )
+    body_html += _render_pagination(
+        "top-movies",
+        auth_query,
+        page=int(page_data["page"]),
+        total_pages=int(page_data["total_pages"]),
+        q=search_text,
+    )
+    return _build_detail_shell(
+        title="Top kinolar",
+        description="Movie views jadvalidagi barcha kontent reytingi. Tartib: views, unique_views, oxirgi ko'rilgan vaqt, code.",
+        body_html=body_html,
+        auth_query=auth_query,
+    )
+
+
+def _build_aggregate_detail_page(
+    *,
+    title: str,
+    description: str,
+    values: list[int],
+    labels: list[str],
+    color_var: str,
+    stats: list[tuple[str, str]],
+    note: str,
+    auth_query: list[tuple[str, str]],
+    footer_html: str = "",
+) -> str:
+    rows_html = [
+        "<tr>"
+        f"<td>{escape(label)}</td>"
+        f"<td>{_format_number(value)}</td>"
+        "</tr>"
+        for label, value in zip(labels, values)
+    ]
+    body_html = _render_stats_strip(stats)
+    body_html += f'<div class="card note-card"><p>{escape(note)}</p></div>'
+    body_html += (
+        '<div class="card">'
+        f'<div class="chart">{_render_chart(values, labels, color_var)}</div>'
+        "</div>"
+    )
+    body_html += _render_table_card(
+        ["Sana", "Qiymat"],
+        rows_html,
+        empty_message="Bu davr uchun agregat ma'lumot topilmadi.",
+        min_width=520,
+    )
+    body_html += footer_html
+    return _build_detail_shell(
+        title=title,
+        description=description,
+        body_html=body_html,
+        auth_query=auth_query,
+    )
+
+
+def _build_detail_page(metric_key: str, query: dict[str, list[str]]) -> str | None:
+    auth_query = _auth_query_pairs(query)
+    user_configs = {
+        "active-subscribers": {
+            "title": "Faol obunachilar",
+            "description": "Hozir botni bloklamagan foydalanuvchilar ro'yxati.",
+            "include_blocked": False,
+            "blocked_only": False,
+            "last_seen_since": None,
+            "first_seen_since": None,
+            "order_by": "COALESCE(last_seen, '') DESC, user_id DESC",
+        },
+        "all-users": {
+            "title": "Jami kirganlar",
+            "description": "Bot ochilgandan beri kirgan barcha foydalanuvchilar ro'yxati.",
+            "include_blocked": True,
+            "blocked_only": False,
+            "last_seen_since": None,
+            "first_seen_since": None,
+            "order_by": "COALESCE(last_seen, '') DESC, user_id DESC",
+        },
+        "entered-today": {
+            "title": "Bugun kirganlar",
+            "description": "Bugun botga kirgan foydalanuvchilar ro'yxati. Bloklagan foydalanuvchilar ham shu yerda qoladi.",
+            "include_blocked": True,
+            "blocked_only": False,
+            "last_seen_since": _db_timestamp(local_day_start_utc()),
+            "first_seen_since": None,
+            "order_by": "COALESCE(last_seen, '') DESC, user_id DESC",
+        },
+        "new-users-today": {
+            "title": "Bugun yangi obunachi",
+            "description": "Bugun birinchi marta kirgan foydalanuvchilar ro'yxati.",
+            "include_blocked": True,
+            "blocked_only": False,
+            "last_seen_since": None,
+            "first_seen_since": _db_timestamp(local_day_start_utc()),
+            "order_by": "COALESCE(first_seen, '') DESC, COALESCE(last_seen, '') DESC, user_id DESC",
+        },
+        "blocked-users": {
+            "title": "Bloklaganlar",
+            "description": "Hozir blok holatida turgan foydalanuvchilar ro'yxati.",
+            "include_blocked": True,
+            "blocked_only": True,
+            "last_seen_since": None,
+            "first_seen_since": None,
+            "order_by": "COALESCE(blocked_at, last_seen, '') DESC, user_id DESC",
+        },
+        "active-24h": {
+            "title": "24 soat faol",
+            "description": "Oxirgi 24 soatda faol bo'lgan bloklanmagan foydalanuvchilar ro'yxati.",
+            "include_blocked": False,
+            "blocked_only": False,
+            "last_seen_since": _db_timestamp(datetime.now(UTC) - timedelta(days=1)),
+            "first_seen_since": None,
+            "order_by": "COALESCE(last_seen, '') DESC, user_id DESC",
+            "note": "Bu sahifadagi asosiy ro'yxat 24 soat ichidagi activity bo'yicha quriladi. 7 kun faol soni faqat qo'shimcha ko'rsatkich sifatida berilgan.",
+        },
+        "recent-users": {
+            "title": "Yaqinda faol bo'lganlar",
+            "description": "Oxirgi 7 kun ichida faol bo'lgan bloklanmagan foydalanuvchilar ro'yxati.",
+            "include_blocked": False,
+            "blocked_only": False,
+            "last_seen_since": _db_timestamp(local_day_start_utc(6)),
+            "first_seen_since": None,
+            "order_by": "COALESCE(last_seen, '') DESC, user_id DESC",
+        },
+    }
+    if metric_key in user_configs:
+        return _build_user_detail_page(metric_key, auth_query, query, user_configs[metric_key])
+
+    if metric_key == "requests-overview":
+        return _build_requests_overview_page(auth_query, query)
+
+    if metric_key == "top-movies":
+        return _build_top_movies_detail_page(auth_query, query)
+
+    if metric_key == "requests-7d":
+        daily = _query_daily_series(7)
+        summary = _query_summary()
+        values = daily["requests"]
+        footer_html = (
+            '<div class="card note-card" style="margin-top:18px;">'
+            f'<a class="inline-link" href="{escape(_build_detail_href("requests-overview", auth_query), quote=True)}">Requestlar ro&apos;yxatini ochish</a>'
+            "</div>"
+        )
+        return _build_aggregate_detail_page(
+            title="Ohirgi 7 kun murojaatlar",
+            description="Daily stats jadvalidagi request agregatlari bo'yicha 7 kunlik kesim.",
+            values=values,
+            labels=daily["labels"],
+            color_var="var(--primary)",
+            stats=[
+                ("7 kun jami", _format_number(sum(values))),
+                ("Bugun", _format_number(values[-1] if values else 0)),
+                ("Jami tarixiy request", _format_number(summary["total_requests"])),
+            ],
+            note="Bu sahifada individual requestlar emas, faqat 7 kunlik aniq agregat saqlanadi.",
+            auth_query=auth_query,
+            footer_html=footer_html,
+        )
+
+    if metric_key == "content-activity-7d":
+        daily = _query_daily_series(7)
+        summary = _query_summary()
+        values = daily["movie_views"]
+        footer_html = (
+            '<div class="card note-card" style="margin-top:18px;">'
+            f'<a class="inline-link" href="{escape(_build_detail_href("top-movies", auth_query), quote=True)}">Top kinolar detail sahifasiga o&apos;tish</a>'
+            "</div>"
+        )
+        return _build_aggregate_detail_page(
+            title="Kontent faolligi 7 kun",
+            description="Daily stats jadvalidagi movie views agregatlari bo'yicha 7 kunlik kesim.",
+            values=values,
+            labels=daily["labels"],
+            color_var="var(--secondary)",
+            stats=[
+                ("7 kun jami", _format_number(sum(values))),
+                ("Bugun", _format_number(values[-1] if values else 0)),
+                ("Jami ko'rishlar", _format_number(summary["total_views"])),
+            ],
+            note="Ko'rishlar bo'yicha user-level tarix alohida saqlanmaydi, shu sabab bu sahifa aniq agregat ko'rinishini beradi.",
+            auth_query=auth_query,
+            footer_html=footer_html,
+        )
+
+    return None
+
+
+def _build_dashboard_page(
+    auth_query: list[tuple[str, str]],
+    payload: dict[str, object] | None = None,
+) -> str:
+    dashboard_payload = payload or _query_dashboard_payload()
+    summary = dashboard_payload["summary"]
+    daily = dashboard_payload["daily"]
+    top_movies = dashboard_payload["top_movies"]
+    recent_users = dashboard_payload["recent_users"]
+    updated_at = str(dashboard_payload["updated_at"])
+
+    active_subscribers_href = escape(_build_detail_href("active-subscribers", auth_query), quote=True)
+    all_users_href = escape(_build_detail_href("all-users", auth_query), quote=True)
+    entered_today_href = escape(_build_detail_href("entered-today", auth_query), quote=True)
+    new_users_today_href = escape(_build_detail_href("new-users-today", auth_query), quote=True)
+    blocked_users_href = escape(_build_detail_href("blocked-users", auth_query), quote=True)
+    active_today_href = escape(_build_detail_href("active-24h", auth_query), quote=True)
+    requests_overview_href = escape(_build_detail_href("requests-overview", auth_query), quote=True)
+    requests_7d_href = escape(_build_detail_href("requests-7d", auth_query), quote=True)
+    content_activity_7d_href = escape(_build_detail_href("content-activity-7d", auth_query), quote=True)
+    top_movies_href = escape(_build_detail_href("top-movies", auth_query), quote=True)
+    recent_users_href = escape(_build_detail_href("recent-users", auth_query), quote=True)
+
+    total_req = summary["total_requests"] or 1
+    completed_pct = int((summary["completed_requests"] / total_req) * 100)
+    pending_pct = int((summary["pending_requests"] / total_req) * 100)
+    rejected_pct = max(0, 100 - completed_pct - pending_pct)
+    if (
+        summary["completed_requests"]
+        + summary["pending_requests"]
+        + summary["rejected_requests"]
+        == 0
+    ):
+        completed_pct, pending_pct, rejected_pct = 0, 0, 0
+
+    return """<!DOCTYPE html>
+<html lang="uz">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Analytiq Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {{
+            --bg: #090e17;
+            --surface: #121826;
+            --surface-hover: #1a2235;
+            --primary: #38bdf8;
+            --secondary: #818cf8;
+            --accent: #f43f5e;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --border: #1e293b;
+        }}
+        * {{ margin: 0; padding: 0; box-sizing: border-box; font-family: 'Outfit', sans-serif; }}
+        body {{ background-color: var(--bg); color: var(--text-main); font-size: 15px; -webkit-font-smoothing: antialiased; padding-bottom: 40px; }}
+        .container {{ max-width: 1100px; margin: 0 auto; padding: 20px; }}
+        h1 {{ font-size: 24px; font-weight: 600; margin-bottom: 4px; }}
+        h2 {{ font-size: 18px; font-weight: 500; color: var(--text-main); margin-bottom: 20px; display: flex; align-items: center; gap: 8px; }}
+        .text-dim {{ color: var(--text-muted); }}
+        .text-sm {{ font-size: 13px; }}
+        .flex {{ display: flex; }}
+        .items-center {{ align-items: center; }}
+        .justify-between {{ justify-content: space-between; }}
+        .grid {{ display: grid; gap: 20px; }}
+        .grid-cols-2 {{ grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }}
+        .grid-cols-4 {{ grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }}
+        .card {{ background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 20px; transition: transform 0.2s; }}
+        .card:hover {{ border-color: rgba(56, 189, 248, 0.4); }}
+        .panel-link {{ display: block; color: inherit; text-decoration: none; }}
+        .panel-link:hover {{ background: var(--surface-hover); transform: translateY(-1px); }}
+        .metric-box {{ text-align: center; padding: 24px 10px; background: linear-gradient(180deg, rgba(255,255,255,0.03) 0%, transparent 100%); border-radius: 12px; }}
+        .metric-title {{ font-size: 14px; font-weight: 500; color: var(--text-muted); margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.5px; }}
+        .metric-val {{ font-size: 42px; font-weight: 700; line-height: 1; margin-bottom: 8px; }}
+        .metric-sub {{ font-size: 13px; font-weight: 500; line-height: 1.45; }}
+        .metric-sub + .metric-sub {{ margin-top: 4px; }}
+        .c-primary {{ color: var(--primary); }}
+        .c-success {{ color: var(--success); }}
+        .c-warning {{ color: var(--warning); }}
+        .c-accent {{ color: var(--accent); }}
+        .bg-success-light {{ background: rgba(16, 185, 129, 0.15); color: var(--success); padding: 4px 8px; border-radius: 6px; font-weight: 600; display: inline-block; }}
+        .status-pipeline {{ display: flex; height: 12px; border-radius: 6px; overflow: hidden; margin-top: 15px; background: rgba(255,255,255,0.05); }}
+        .pipeline-item {{ height: 100%; transition: width 1s ease-out; animation: fillWidth 1.5s ease-out forwards; }}
+        .legend {{ display: flex; justify-content: space-between; margin-top: 16px; font-size: 13px; font-weight: 500; flex-wrap: wrap; gap: 10px; }}
+        .legend > div {{ display: flex; align-items: center; gap: 6px; }}
+        .dot {{ width: 10px; height: 10px; border-radius: 50%; }}
+        .list-item {{ display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid rgba(255,255,255,0.05); }}
+        .list-item:last-child {{ border-bottom: none; }}
+        .rank-badge {{ width: 28px; height: 28px; border-radius: 8px; background: rgba(255,255,255,0.1); display: flex; align-items: center; justify-content: center; font-weight: 600; font-size: 13px; margin-right: 12px; flex-shrink: 0; }}
+        .rank-1 {{ background: rgba(245, 158, 11, 0.2); color: var(--warning); }}
+        .rank-2 {{ background: rgba(148, 163, 184, 0.2); color: #cbd5e1; }}
+        .rank-3 {{ background: rgba(217, 119, 6, 0.2); color: #b45309; }}
+        .rank-other {{ background: rgba(255,255,255,0.05); color: var(--text-muted); }}
+        .progress-bg {{ height: 6px; background: rgba(255,255,255,0.1); border-radius: 3px; width: 80px; overflow: hidden; display:inline-block; vertical-align: middle; }}
+        .progress-fill {{ height: 100%; background: var(--primary); border-radius: 3px; animation: fillWidth 1s ease-out forwards; }}
+        .chart {{ display: flex; align-items: flex-end; gap: 8px; height: 180px; margin-top: 20px; }}
+        .chart-col {{ flex: 1; min-width: 0; height: 100%; display: flex; flex-direction: column; justify-content: flex-end; align-items: center; gap: 8px; }}
+        .chart-value {{ min-height: 14px; font-size: 11px; color: var(--text-muted); line-height: 1; }}
+        .bar-wrap {{ width: 100%; height: 120px; flex: none; background: rgba(255,255,255,0.03); border-radius: 4px; display: flex; align-items: flex-end; overflow: hidden; }}
+        .bar-wrap:hover .bar {{ filter: brightness(1.2); }}
+        .bar {{ width: 100%; display: block; border-radius: 4px 4px 0 0; animation: fillBar 1s ease-out forwards; transform-origin: bottom; }}
+        .chart-label {{ font-size: 11px; color: var(--text-muted); }}
+        .live-status {{ display: inline-flex; align-items: center; gap: 6px; background: rgba(16, 185, 129, 0.15); border: 1px solid rgba(16, 185, 129, 0.3); padding: 4px 10px; border-radius: 50px; color: var(--success); font-size: 12px; font-weight: 600; letter-spacing: 0.5px; }}
+        @keyframes pulse-dot {{ 0% {{ opacity: 1; }} 50% {{ opacity: 0.4; }} 100% {{ opacity: 1; }} }}
+        .dot-blink {{ width: 6px; height: 6px; background: var(--success); border-radius: 50%; animation: pulse-dot 1.5s infinite; }}
+        .fade-in {{ animation: fadeIn 0.4s ease-out forwards; opacity: 0; }}
+        @keyframes fadeIn {{ from{{ opacity:0; transform:translateY(10px); }} to{{ opacity:1; transform:translateY(0); }} }}
+        @keyframes fillBar {{ from {{ transform: scaleY(0); }} to {{ transform: scaleY(1); }} }}
+        @keyframes fillWidth {{ from {{ width: 0; }} }}
+    </style>
+</head>
+<body style="background-color:#090e17;color:#f8fafc;">
+    <div class="container">
+        <header class="flex justify-between items-center fade-in" style="margin-bottom: 30px;">
+            <div>
+                <h1>Admin Analytiq</h1>
+                <p class="text-dim text-sm">Bot va tizim ma'lumotlari markazi</p>
+            </div>
+            <div class="live-status"><div class="dot-blink"></div>JONLI</div>
+        </header>
+        <div class="grid grid-cols-4 fade-in" style="animation-delay: 0.1s; margin-bottom: 24px;">
+            <a class="card metric-box panel-link" href="{active_subscribers_href}">
+                <div class="metric-title">Faol Obunachilar</div>
+                <div class="metric-val c-primary">{total_users}</div>
+                <div class="metric-sub text-dim">Hozir botni bloklamagan foydalanuvchilar</div>
+            </a>
+            <a class="card metric-box panel-link" href="{all_users_href}">
+                <div class="metric-title">Jami Kirganlar</div>
+                <div class="metric-val">{all_time_users}</div>
+                <div class="metric-sub text-dim">Bot ochilgandan beri kirgan barcha userlar</div>
+            </a>
+            <a class="card metric-box panel-link" href="{entered_today_href}">
+                <div class="metric-title">Bugun Kirganlar</div>
+                <div class="metric-val c-success">{entered_today}</div>
+                <div class="metric-sub text-dim">Bugun botga kirganlar, bloklaganlar ham kiradi</div>
+            </a>
+            <a class="card metric-box panel-link" href="{new_users_today_href}">
+                <div class="metric-title">Bugun Yangi Obunachi</div>
+                <div class="metric-val c-primary">{new_subscribers_today}</div>
+                <div class="metric-sub text-dim">Bugun birinchi marta kirgan foydalanuvchilar</div>
+            </a>
+            <a class="card metric-box panel-link" href="{blocked_users_href}" style="border-color: rgba(244, 63, 94, 0.3);">
+                <div class="metric-title" style="color: var(--accent)">Bloklaganlar</div>
+                <div class="metric-val c-accent">{blocked_users}</div>
+                <div class="metric-sub text-dim">Hozir blok holatida turgan userlar</div>
+            </a>
+            <a class="card metric-box panel-link" href="{active_today_href}" style="border-color: rgba(245, 158, 11, 0.3);">
+                <div class="metric-title" style="color: var(--warning)">24 Soat Faol</div>
+                <div class="metric-val c-warning">{active_today}</div>
+                <div class="metric-sub text-dim">7 kun faol: <span style="color:var(--text-main)">{active_week}</span></div>
+            </a>
+        </div>
+        <a class="card panel-link fade-in" href="{requests_overview_href}" style="animation-delay: 0.2s; margin-bottom: 24px;">
+            <h2>📊 So'rovlar Volyumi (Pipeline)</h2>
+            <div class="flex justify-between items-center text-sm">
+                <span class="text-dim">Jami kelib tushgan so'rovlar: <strong style="color:var(--text-main); font-size:16px;">{total_requests}</strong> ta</span>
+            </div>
+            <div class="status-pipeline">
+                <div class="pipeline-item" style="background: var(--success); width: {completed_pct}%;"></div>
+                <div class="pipeline-item" style="background: var(--warning); width: {pending_pct}%;"></div>
+                <div class="pipeline-item" style="background: var(--accent); width: {rejected_pct}%;"></div>
+            </div>
+            <div class="legend">
+                <div><div class="dot" style="background: var(--success);"></div> {completed_requests} Bajarilgan ({completed_pct}%)</div>
+                <div><div class="dot" style="background: var(--warning);"></div> {pending_requests} Navbatda ({pending_pct}%)</div>
+                <div><div class="dot" style="background: var(--accent);"></div> {rejected_requests} Rad etilgan ({rejected_pct}%)</div>
+            </div>
+        </a>
+        <div class="grid grid-cols-2">
+            <a class="card panel-link fade-in" href="{requests_7d_href}" style="animation-delay: 0.3s;">
+                <h2>📈 Ohirgi 7 kun Murojaatlar</h2>
+                <div class="text-sm text-dim">So'rovlar (Requests) kunlik kelish grafikasi</div>
+                <div class="chart">
+                    {requests_bars}
+                </div>
+            </a>
+            <a class="card panel-link fade-in" href="{content_activity_7d_href}" style="animation-delay: 0.4s;">
+                <h2>👁️ Kontent Faolligi</h2>
+                <div class="text-sm text-dim">7 kun ichida kinolar ko'rilishi trendi</div>
+                <div class="chart">
+                    {views_bars}
+                </div>
+            </a>
+            <a class="card panel-link fade-in" href="{top_movies_href}" style="animation-delay: 0.5s;">
+                <h2>🏆 Top Kinolar</h2>
+                <div>
+                    {top_movies_html}
+                </div>
+            </a>
+            <a class="card panel-link fade-in" href="{recent_users_href}" style="animation-delay: 0.6s;">
+                <h2>👥 Yaqinda faol bo'lganlar</h2>
+                <div>
+                    {recent_users_html}
+                </div>
+            </a>
+        </div>
+        <div class="text-sm text-dim flex justify-between" style="margin-top: 30px;">
+            <span>Yaratildi: PrimeCinema Tech</span>
+            <span>So'nggi yangilanish: {updated_at}</span>
+        </div>
+    </div>
+</body>
+</html>""".format(
+        updated_at=updated_at,
+        total_users=_format_number(summary["total_users"]),
+        all_time_users=_format_number(summary["all_time_users"]),
+        entered_today=_format_number(summary["entered_today"]),
+        new_subscribers_today=_format_number(summary["new_subscribers_today"]),
+        blocked_users=_format_number(summary["blocked_users"]),
+        active_today=_format_number(summary["active_today"]),
+        active_week=_format_number(summary["active_week"]),
+        total_requests=_format_number(summary["total_requests"]),
+        pending_requests=_format_number(summary["pending_requests"]),
+        completed_requests=_format_number(summary["completed_requests"]),
+        rejected_requests=_format_number(summary["rejected_requests"]),
+        completed_pct=completed_pct,
+        pending_pct=pending_pct,
+        rejected_pct=rejected_pct,
+        active_subscribers_href=active_subscribers_href,
+        all_users_href=all_users_href,
+        entered_today_href=entered_today_href,
+        new_users_today_href=new_users_today_href,
+        blocked_users_href=blocked_users_href,
+        active_today_href=active_today_href,
+        requests_overview_href=requests_overview_href,
+        requests_7d_href=requests_7d_href,
+        content_activity_7d_href=content_activity_7d_href,
+        top_movies_href=top_movies_href,
+        recent_users_href=recent_users_href,
+        requests_bars=_render_chart(daily["requests"], daily["labels"], "var(--primary)"),
+        views_bars=_render_chart(daily["movie_views"], daily["labels"], "var(--secondary)"),
+        top_movies_html=_render_top_movies(top_movies),
+        recent_users_html=_render_recent_users(recent_users),
+    )
+
+
+_cache = {"payload": None, "timestamp": 0.0}
 CACHE_TTL = 30
 
 
@@ -1539,6 +2659,34 @@ class SimpleHandler(BaseHTTPRequestHandler):
             _send_bytes(self, 200, body, content_type="text/html; charset=utf-8")
             return
 
+        if path.startswith(DETAIL_ROUTE_PREFIX):
+            if not _stats_request_is_authorized(self, query):
+                body = (
+                    _unauthorized_stats_page()
+                    if _is_local_stats_request(self)
+                    else _stats_auth_bootstrap_page()
+                )
+                _send_bytes(
+                    self,
+                    403 if _is_local_stats_request(self) else 200,
+                    body,
+                    content_type="text/html; charset=utf-8",
+                )
+                return
+
+            metric_key = unquote(path[len(DETAIL_ROUTE_PREFIX) :]).strip().strip("/")
+            body_text = _build_detail_page(metric_key, query)
+            if body_text is None:
+                self.send_error(404, "Not Found")
+                return
+            _send_bytes(
+                self,
+                200,
+                body_text.encode("utf-8"),
+                content_type="text/html; charset=utf-8",
+            )
+            return
+
         if path not in {"/", "/index.html"}:
             self.send_error(404, "Not Found")
             return
@@ -1549,17 +2697,23 @@ class SimpleHandler(BaseHTTPRequestHandler):
                 if _is_local_stats_request(self)
                 else _stats_auth_bootstrap_page()
             )
-            _send_bytes(self, 403 if _is_local_stats_request(self) else 200, body, content_type="text/html; charset=utf-8")
+            _send_bytes(
+                self,
+                403 if _is_local_stats_request(self) else 200,
+                body,
+                content_type="text/html; charset=utf-8",
+            )
             return
 
         global _cache
         current_time = time.time()
-
-        if current_time - _cache["timestamp"] > CACHE_TTL:
-            _cache["data"] = _build_page().encode("utf-8")
+        payload = _cache.get("payload")
+        if payload is None or current_time - _cache["timestamp"] > CACHE_TTL:
+            payload = _query_dashboard_payload()
+            _cache["payload"] = payload
             _cache["timestamp"] = current_time
 
-        body = _cache["data"]
+        body = _build_dashboard_page(_auth_query_pairs(query), payload).encode("utf-8")
         _send_bytes(self, 200, body, content_type="text/html; charset=utf-8")
 
     def log_message(self, format: str, *args: object) -> None:
@@ -1568,17 +2722,27 @@ class SimpleHandler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     pid_path = Path(__file__).resolve().with_name(".webapp.pid")
-    pid_path.write_text(str(os.getpid()), encoding="utf-8")
+    server_address = ("0.0.0.0", PORT)
+    try:
+        httpd = ReusableHTTPServer(server_address, SimpleHandler)
+    except OSError as exc:
+        print(
+            f"Web app porti band yoki serverni ochib bo'lmadi ({server_address[1]}): {exc}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from exc
 
     try:
-        server_address = ("0.0.0.0", PORT)
+        pid_path.write_text(str(os.getpid()), encoding="utf-8")
         print(
             f"Web app server running on http://{server_address[0]}:{server_address[1]}"
         )
         print(
             "Expose this address with a tunnel and use the HTTPS URL as STATS_WEBAPP_URL."
         )
-        ReusableHTTPServer(server_address, SimpleHandler).serve_forever()
+        httpd.serve_forever()
     finally:
+        with suppress(OSError):
+            httpd.server_close()
         with suppress(OSError):
             pid_path.unlink()

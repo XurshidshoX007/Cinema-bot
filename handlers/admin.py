@@ -672,7 +672,7 @@ def _render_helper_admins_panel(helper_admins: list[dict[str, object]]) -> str:
         lines.append(
             f"{index}. {_helper_admin_label(helper_admin)} ({helper_admin['user_id']})"
         )
-        lines.append(f"   в”” {summary}")
+        lines.append(f"   └ {summary}")
 
     return "\n".join(lines)
 
@@ -714,7 +714,7 @@ def _render_content_overview_section(
         start=1,
     ):
         lines.append(f"{index}. {item_title}")
-        lines.append(f"   в”” Kod: {code}")
+        lines.append(f"   └ Kod: {code}")
 
     remaining = len(items) - CONTENT_LIST_PREVIEW_SIZE
     if remaining > 0:
@@ -757,7 +757,7 @@ def _render_content_section_page(
             page_items, start=start + 1
         ):
             lines.append(f"{absolute_index}. {title}")
-            lines.append(f"   в”” Kod: {code}")
+            lines.append(f"   └ Kod: {code}")
     else:
         lines.extend(["", "Bu bo'limda hali kontent yo'q."])
 
@@ -847,7 +847,7 @@ def _render_delete_panel_text(
             page_items, start=start_index + 1
         ):
             lines.append(f"{index}. {_content_kind_icon(content_kind)} {title}")
-            lines.append(f"   в”” Kod: {code}")
+            lines.append(f"   └ Kod: {code}")
     else:
         lines.extend(["", "Bu bo'limda o'chirish uchun kontent yo'q."])
 
@@ -868,7 +868,7 @@ def _sparkline(values: list[int]) -> str:
 
     maximum = max(values)
     if maximum <= 0:
-        return "В·" * len(values)
+        return "·" * len(values)
 
     last_index = len(SPARKLINE_BARS) - 1
     return "".join(
@@ -885,7 +885,7 @@ def _bar_chart(label: str, value: int, maximum: int, width: int = 10) -> str:
 
     filled = min(width, filled)
     empty = width - filled
-    return f"{label:<12} {'в–€' * filled}{'в–‘' * empty} {value}"
+    return f"{label:<12} {'█' * filled}{'░' * empty} {value}"
 
 
 def _format_recent_users(users: list[tuple[int, str | None, str, str]]) -> str:
@@ -1101,7 +1101,7 @@ def _build_dashboard_caption(panel: str, payload: dict) -> str:
             f"• So'rovlar: {_sparkline(trends['requests'])}\n"
             f"• Ko'rishlar: {_sparkline(trends['movie_views'])}\n"
             f"• Yangi users: {_sparkline(trends['new_users'])}\n\n"
-            "рџ• So'nggi faollar\n"
+            "🕘 So'nggi faollar\n"
             f"{_format_recent_users(payload['recent_users'])}"
         )
 
@@ -1208,19 +1208,19 @@ def _build_stats_insights(summary: dict[str, int]) -> str:
     recommendations = []
     if summary["pending_requests"] >= 10:
         recommendations.append(
-            "рџ”” KoвЂp kutayotgan soвЂrovlar bor вЂ” soвЂrovlar boвЂlimini tekshiring."
+            "🔔 Ko'p kutayotgan so'rovlar bor — so'rovlar bo'limini tekshiring."
         )
     if summary["entered_today"] <= max(10, summary["total_users"] // 20):
         recommendations.append(
-            "рџ“Ј Bugungi faol foydalanuvchilar soni past вЂ” foydalanuvchi ragвЂbatlantirish kampaniyasini koвЂrib chiqing."
+            "📣 Bugungi faol foydalanuvchilar soni past — foydalanuvchi rag'batlantirish kampaniyasini ko'rib chiqing."
         )
     if summary["total_views"] <= 100:
         recommendations.append(
-            "рџЋ¬ KoвЂrishlar kam вЂ” kontentni ommalashtirish va yangi filmlar qoвЂshish foydali boвЂladi."
+            "🎬 Ko'rishlar kam — kontentni ommalashtirish va yangi filmlar qo'shish foydali bo'ladi."
         )
     if summary["rejected_requests"] >= summary["total_requests"] * 0.3:
         recommendations.append(
-            "вљ пёЏ SoвЂrovlarning katta qismi rad etilmoqda вЂ” qoidalarni va moderatsiyani qayta koвЂrib chiqing."
+            "⚠️ So'rovlarning katta qismi rad etilmoqda — qoidalarni va moderatsiyani qayta ko'rib chiqing."
         )
     if not recommendations:
         recommendations.append(
@@ -1240,12 +1240,12 @@ async def _show_stats_webapp(message: types.Message) -> None:
         f"• 24 soat faol: {summary['active_today']}\n"
         f"• 7 kun davomida faol: {summary['active_week']}\n"
         f"• Jami kinolar: {summary['total_movies']}\n"
-        f"вЂў Jami koвЂrishlar: {summary['total_views']}\n"
-        f"вЂў Jami soвЂrovlar: {summary['total_requests']}\n"
-        f"вЂў Kutayotgan/aktual soвЂrovlar: {summary['pending_requests']}\n"
-        f"вЂў Bajarilgan soвЂrovlar: {summary['completed_requests']}\n"
-        f"вЂў Rad etilgan soвЂrovlar: {summary['rejected_requests']}\n\n"
-        "рџ“Њ Quyidagi tavsiyalar boshqaruv uchun foydali boвЂlishi mumkin:\n"
+        f"• Jami ko'rishlar: {summary['total_views']}\n"
+        f"• Jami so'rovlar: {summary['total_requests']}\n"
+        f"• Kutayotgan/aktual so'rovlar: {summary['pending_requests']}\n"
+        f"• Bajarilgan so'rovlar: {summary['completed_requests']}\n"
+        f"• Rad etilgan so'rovlar: {summary['rejected_requests']}\n\n"
+        "📌 Quyidagi tavsiyalar boshqaruv uchun foydali bo'lishi mumkin:\n"
         f"{_build_stats_insights(summary)}"
     )
 
