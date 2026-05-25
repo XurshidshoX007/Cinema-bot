@@ -78,8 +78,15 @@ def _get_env(name: str) -> str:
 
     value = os.getenv(name)
     if value is None:
-        raise ValueError(f"{name} topilmadi")
-    return value.strip()
+        raise ValueError(
+            f"{name} topilmadi. Uni environment'da yoki {ENV_PATH} faylida belgilang."
+        )
+    value = value.strip()
+    if not value:
+        raise ValueError(
+            f"{name} bosh. Uni environment'da yoki {ENV_PATH} faylida to'ldiring."
+        )
+    return value
 
 
 def _get_env_optional(name: str, default: str = "") -> str:

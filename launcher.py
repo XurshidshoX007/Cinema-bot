@@ -20,6 +20,16 @@ creation_flags = 0
 if os.name == "nt":
     creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP
 
+
+def _read_log_tail(path: Path, line_count: int = 20) -> str:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    if not lines:
+        return ""
+    return "\n".join(lines[-line_count:])
+
 with log_file.open("a", encoding="utf-8") as log_stream:
     process = subprocess.Popen(
         [python_executable, str(script_path)],
@@ -35,6 +45,10 @@ while time.time() < deadline:
     exit_code = process.poll()
     if exit_code is not None:
         print(f"{script_name} tez yopildi: exit_code={exit_code}", file=sys.stderr)
+        recent_log = _read_log_tail(log_file)
+        if recent_log:
+            print(f"{script_name} logining oxirgi qatorlari:", file=sys.stderr)
+            print(recent_log, file=sys.stderr)
         sys.exit(exit_code or 1)
     time.sleep(0.2)
 
