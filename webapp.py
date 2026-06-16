@@ -50,6 +50,7 @@ REQUEST_STATUS_FILTERS = {
     "pending-group": "Navbatda",
     "completed": "Bajarilgan",
     "rejected": "Rad etilgan",
+    "other": "Boshqa statuslar",
 }
 _REQUEST_HOST_RE = re.compile(r"^\[?[A-Za-z0-9:.%-]+\]?(?::\d{1,5})?$")
 
@@ -76,6 +77,39 @@ def _format_date(date_value: str) -> str:
 
 def _db_timestamp(value: datetime) -> str:
     return value.replace(tzinfo=None, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _request_pipeline_counts(summary: dict[str, int]) -> dict[str, int]:
+    completed = int(summary.get("completed_requests", 0) or 0)
+    pending = int(summary.get("pending_requests", 0) or 0)
+    rejected = int(summary.get("rejected_requests", 0) or 0)
+    total = int(summary.get("total_requests", 0) or 0)
+    known_total = completed + pending + rejected
+    other = max(0, total - known_total)
+    denominator = max(known_total, 1)
+    if known_total <= 0:
+        return {
+            "completed": completed,
+            "pending": pending,
+            "rejected": rejected,
+            "other": other,
+            "completed_pct": 0,
+            "pending_pct": 0,
+            "rejected_pct": 0,
+        }
+
+    completed_pct = round((completed / denominator) * 100)
+    pending_pct = round((pending / denominator) * 100)
+    rejected_pct = max(0, 100 - completed_pct - pending_pct)
+    return {
+        "completed": completed,
+        "pending": pending,
+        "rejected": rejected,
+        "other": other,
+        "completed_pct": completed_pct,
+        "pending_pct": pending_pct,
+        "rejected_pct": rejected_pct,
+    }
 
 
 def _request_host(
@@ -1479,6 +1513,11 @@ def _query_requests_detail_page(
             where_parts.append("r.status = 'completed'")
         elif status_filter == "rejected":
             where_parts.append("r.status = 'rejected'")
+        elif status_filter == "other":
+            where_parts.append(
+                "LOWER(COALESCE(r.status, 'pending')) NOT IN "
+                "('pending', 'accepted', 'completed', 'rejected')"
+            )
 
         search_clause, search_params = _request_search_clause(search_text)
         where_sql = " AND ".join(where_parts) + search_clause
@@ -1616,6 +1655,8 @@ def _render_request_tabs(
         ("completed", REQUEST_STATUS_FILTERS["completed"], counts.get("completed", 0)),
         ("rejected", REQUEST_STATUS_FILTERS["rejected"], counts.get("rejected", 0)),
     ]
+    if counts.get("other", 0):
+        items.append(("other", REQUEST_STATUS_FILTERS["other"], counts.get("other", 0)))
     links = []
     for status_key, label, count in items:
         href = _build_detail_href(
@@ -1638,17 +1679,16 @@ def _build_page() -> str:
     recent_users = _query_recent_users(6)
     updated_at = f"{local_now_text()} {APP_TIMEZONE_LABEL}"
 
-    total_req = summary["total_requests"] or 1
-    completed_pct = int((summary["completed_requests"] / total_req) * 100)
-    pending_pct = int((summary["pending_requests"] / total_req) * 100)
-    rejected_pct = max(0, 100 - completed_pct - pending_pct)
-    if (
-        summary["completed_requests"]
-        + summary["pending_requests"]
-        + summary["rejected_requests"]
-        == 0
-    ):
-        completed_pct, pending_pct, rejected_pct = 0, 0, 0
+    pipeline = _request_pipeline_counts(summary)
+    completed_pct = pipeline["completed_pct"]
+    pending_pct = pipeline["pending_pct"]
+    rejected_pct = pipeline["rejected_pct"]
+    other_requests = pipeline["other"]
+    other_status_note = (
+        f'<div class="text-sm text-dim" style="margin-top:12px;">Boshqa statuslar pipeline foiziga kiritilmadi: {_format_number(other_requests)} ta.</div>'
+        if other_requests
+        else ""
+    )
 
     return """<!DOCTYPE html>
 <html lang="uz">
@@ -1772,17 +1812,17 @@ def _build_page() -> str:
             <div class="card metric-box">
                 <div class="metric-title">Faol Obunachilar</div>
                 <div class="metric-val c-primary">{total_users}</div>
-                <div class="metric-sub text-dim">Hozir botni bloklamagan foydalanuvchilar</div>
+                <div class="metric-sub text-dim">Hozir botni bloklamagan userlar</div>
             </div>
             <div class="card metric-box">
                 <div class="metric-title">Jami Kirganlar</div>
                 <div class="metric-val">{all_time_users}</div>
-                <div class="metric-sub text-dim">Bot ochilgandan beri kirgan barcha userlar</div>
+                <div class="metric-sub text-dim">Admin/helperlardan tashqari barcha userlar</div>
             </div>
             <div class="card metric-box">
                 <div class="metric-title">Bugun Kirganlar</div>
                 <div class="metric-val c-success">{entered_today}</div>
-                <div class="metric-sub text-dim">Bugun botga kirganlar, bloklaganlar ham kiradi</div>
+                <div class="metric-sub text-dim">Bugun oxirgi faolligi bor userlar</div>
             </div>
             <div class="card metric-box">
                 <div class="metric-title">Bugun Yangi Obunachi</div>
@@ -1797,13 +1837,13 @@ def _build_page() -> str:
             <div class="card metric-box" style="border-color: rgba(245, 158, 11, 0.3);">
                 <div class="metric-title" style="color: var(--warning)">24 Soat Faol</div>
                 <div class="metric-val c-warning">{active_today}</div>
-                <div class="metric-sub text-dim">7 kun faol: <span style="color:var(--text-main)">{active_week}</span></div>
+                <div class="metric-sub text-dim">So'nggi 24 soat, bloklamaganlar<br>7 kun faol: <span style="color:var(--text-main)">{active_week}</span></div>
             </div>
         </div>
 
         <!-- Request Pipeline Bar -->
         <div class="card fade-in" style="animation-delay: 0.2s; margin-bottom: 24px;">
-            <h2>📊 So'rovlar Volyumi (Pipeline)</h2>
+            <h2>So'rovlar pipeline</h2>
             <div class="flex justify-between items-center text-sm">
                 <span class="text-dim">Jami kelib tushgan so'rovlar: <strong style="color:var(--text-main); font-size:16px;">{total_requests}</strong> ta</span>
             </div>
@@ -1819,13 +1859,14 @@ def _build_page() -> str:
                 <div><div class="dot" style="background: var(--warning);"></div> {pending_requests} Navbatda ({pending_pct}%)</div>
                 <div><div class="dot" style="background: var(--accent);"></div> {rejected_requests} Rad etilgan ({rejected_pct}%)</div>
             </div>
+            {other_status_note}
         </div>
 
         <div class="grid grid-cols-2">
             <!-- Traffic Chart -->
             <div class="card fade-in" style="animation-delay: 0.3s;">
-                <h2>📈 Ohirgi 7 kun Murojaatlar</h2>
-                <div class="text-sm text-dim">So'rovlar (Requests) kunlik kelish grafikasi</div>
+                <h2>Oxirgi 7 kun murojaatlar</h2>
+                <div class="text-sm text-dim">daily_stats jadvalidagi requests agregati</div>
                 <div class="chart">
                     {requests_bars}
                 </div>
@@ -1833,8 +1874,8 @@ def _build_page() -> str:
 
             <!-- Views Chart -->
             <div class="card fade-in" style="animation-delay: 0.4s;">
-                <h2>👁️ Kontent Faolligi</h2>
-                <div class="text-sm text-dim">7 kun ichida kinolar ko'rilishi trendi</div>
+                <h2>Kontent faolligi</h2>
+                <div class="text-sm text-dim">daily_stats jadvalidagi movie_views agregati</div>
                 <div class="chart">
                     {views_bars}
                 </div>
@@ -1842,7 +1883,7 @@ def _build_page() -> str:
             
             <!-- Top Movies List -->
             <div class="card fade-in" style="animation-delay: 0.5s;">
-                <h2>🏆 Top Kinolar</h2>
+                <h2>Top kinolar</h2>
                 <div>
                     {top_movies_html}
                 </div>
@@ -1850,7 +1891,7 @@ def _build_page() -> str:
 
             <!-- Recent Users List -->
             <div class="card fade-in" style="animation-delay: 0.6s;">
-                <h2>👥 Yaqinda faol bo'lganlar</h2>
+                <h2>Yaqinda faol bo'lganlar</h2>
                 <div>
                     {recent_users_html}
                 </div>
@@ -1879,6 +1920,7 @@ def _build_page() -> str:
         pending_requests=_format_number(summary["pending_requests"]),
         completed_requests=_format_number(summary["completed_requests"]),
         rejected_requests=_format_number(summary["rejected_requests"]),
+        other_status_note=other_status_note,
         completed_pct=completed_pct,
         pending_pct=pending_pct,
         rejected_pct=rejected_pct,
@@ -1992,6 +2034,7 @@ def _build_requests_overview_page(
         "pending-group": summary["pending_requests"],
         "completed": summary["completed_requests"],
         "rejected": summary["rejected_requests"],
+        "other": _request_pipeline_counts(summary)["other"],
     }
 
     stats = [
@@ -1999,6 +2042,8 @@ def _build_requests_overview_page(
         ("Ko'rsatilgan", _format_number(int(page_data["total_count"]))),
         ("Status", REQUEST_STATUS_FILTERS[status_filter]),
     ]
+    if counts["other"]:
+        stats.append(("Boshqa status", _format_number(counts["other"])))
     if search_text:
         stats.append(("Qidiruv", search_text))
 
@@ -2013,8 +2058,10 @@ def _build_requests_overview_page(
             badge = '<span class="badge badge-accent">rejected</span>'
         elif status_value == "accepted":
             badge = '<span class="badge badge-neutral">accepted</span>'
-        else:
+        elif status_value == "pending":
             badge = '<span class="badge badge-warning">pending</span>'
+        else:
+            badge = f'<span class="badge badge-neutral">{escape(status_value or "other")}</span>'
         file_label = "Bor" if str(row["file_id"] or "").strip() else "Yo'q"
         rows_html.append(
             "<tr>"
@@ -2042,7 +2089,7 @@ def _build_requests_overview_page(
         hidden_pairs=[] if status_filter == "all" else [("status", status_filter)],
     )
     body_html += _render_table_card(
-        ["Request ID", "Foydalanuvchi", "Raw status", "Matn", "Fayl"],
+        ["Request ID", "Foydalanuvchi", "Status", "Matn", "Fayl"],
         rows_html,
         empty_message="Bu filtr bo'yicha request topilmadi.",
         min_width=860,
@@ -2057,7 +2104,7 @@ def _build_requests_overview_page(
     )
     return _build_detail_shell(
         title="So'rovlar overview",
-        description="Requestlar ro'yxati status va qidiruv filtrlari bilan. pending-group filtri pending va accepted yozuvlarni birga ko'rsatadi.",
+        description="requests jadvalidagi admin/helperlardan tashqari user so'rovlari. Navbatda filtri pending va accepted statuslarini birga ko'rsatadi.",
         body_html=body_html,
         auth_query=auth_query,
     )
@@ -2075,6 +2122,7 @@ def _build_top_movies_detail_page(
     stats = [
         ("Jami kino", _format_number(int(page_data["total_count"]))),
         ("Ko'rishlar jami", _format_number(summary["total_views"])),
+        ("Unique user", "Takroriy ko'rishsiz"),
         ("Sahifa", f"{page_data['page']} / {page_data['total_pages']}"),
     ]
     if search_text:
@@ -2118,7 +2166,7 @@ def _build_top_movies_detail_page(
     )
     return _build_detail_shell(
         title="Top kinolar",
-        description="Movie views jadvalidagi barcha kontent reytingi. Tartib: views, unique_views, oxirgi ko'rilgan vaqt, code.",
+        description="movie_views jadvalidagi kontent reytingi. Ko'rishlar jami ochilishlar, Unique user esa takroriy ko'rishsiz userlar soni.",
         body_html=body_html,
         auth_query=auth_query,
     )
@@ -2170,7 +2218,7 @@ def _build_detail_page(metric_key: str, query: dict[str, list[str]]) -> str | No
     user_configs = {
         "active-subscribers": {
             "title": "Faol obunachilar",
-            "description": "Hozir botni bloklamagan foydalanuvchilar ro'yxati.",
+            "description": "users jadvalidagi hozir botni bloklamagan, admin/helper bo'lmagan userlar.",
             "include_blocked": False,
             "blocked_only": False,
             "last_seen_since": None,
@@ -2179,7 +2227,7 @@ def _build_detail_page(metric_key: str, query: dict[str, list[str]]) -> str | No
         },
         "all-users": {
             "title": "Jami kirganlar",
-            "description": "Bot ochilgandan beri kirgan barcha foydalanuvchilar ro'yxati.",
+            "description": "users jadvalidagi admin/helperlardan tashqari barcha userlar, bloklaganlar ham kiradi.",
             "include_blocked": True,
             "blocked_only": False,
             "last_seen_since": None,
@@ -2188,7 +2236,7 @@ def _build_detail_page(metric_key: str, query: dict[str, list[str]]) -> str | No
         },
         "entered-today": {
             "title": "Bugun kirganlar",
-            "description": "Bugun botga kirgan foydalanuvchilar ro'yxati. Bloklagan foydalanuvchilar ham shu yerda qoladi.",
+            "description": "Bugun oxirgi faolligi qayd etilgan userlar. Bloklagan userlar ham ko'rsatiladi.",
             "include_blocked": True,
             "blocked_only": False,
             "last_seen_since": _db_timestamp(local_day_start_utc()),
@@ -2197,7 +2245,7 @@ def _build_detail_page(metric_key: str, query: dict[str, list[str]]) -> str | No
         },
         "new-users-today": {
             "title": "Bugun yangi obunachi",
-            "description": "Bugun birinchi marta kirgan foydalanuvchilar ro'yxati.",
+            "description": "first_seen bugungi lokal kunga tushgan, admin/helper bo'lmagan userlar.",
             "include_blocked": True,
             "blocked_only": False,
             "last_seen_since": None,
@@ -2206,7 +2254,7 @@ def _build_detail_page(metric_key: str, query: dict[str, list[str]]) -> str | No
         },
         "blocked-users": {
             "title": "Bloklaganlar",
-            "description": "Hozir blok holatida turgan foydalanuvchilar ro'yxati.",
+            "description": "users jadvalidagi hozir botni bloklagan userlar.",
             "include_blocked": True,
             "blocked_only": True,
             "last_seen_since": None,
@@ -2215,17 +2263,17 @@ def _build_detail_page(metric_key: str, query: dict[str, list[str]]) -> str | No
         },
         "active-24h": {
             "title": "24 soat faol",
-            "description": "Oxirgi 24 soatda faol bo'lgan bloklanmagan foydalanuvchilar ro'yxati.",
+            "description": "Oxirgi 24 soatda last_seen yangilangan, botni bloklamagan userlar.",
             "include_blocked": False,
             "blocked_only": False,
             "last_seen_since": _db_timestamp(datetime.now(UTC) - timedelta(days=1)),
             "first_seen_since": None,
             "order_by": "COALESCE(last_seen, '') DESC, user_id DESC",
-            "note": "Bu sahifadagi asosiy ro'yxat 24 soat ichidagi activity bo'yicha quriladi. 7 kun faol soni faqat qo'shimcha ko'rsatkich sifatida berilgan.",
+            "note": "Asosiy ro'yxat so'nggi 24 soat bo'yicha. 7 kun faol soni faqat solishtirish uchun ko'rsatiladi.",
         },
         "recent-users": {
             "title": "Yaqinda faol bo'lganlar",
-            "description": "Oxirgi 7 kun ichida faol bo'lgan bloklanmagan foydalanuvchilar ro'yxati.",
+            "description": "Oxirgi 7 kun ichida last_seen yangilangan, botni bloklamagan userlar.",
             "include_blocked": False,
             "blocked_only": False,
             "last_seen_since": _db_timestamp(local_day_start_utc(6)),
@@ -2253,7 +2301,7 @@ def _build_detail_page(metric_key: str, query: dict[str, list[str]]) -> str | No
         )
         return _build_aggregate_detail_page(
             title="Ohirgi 7 kun murojaatlar",
-            description="Daily stats jadvalidagi request agregatlari bo'yicha 7 kunlik kesim.",
+            description="daily_stats jadvalidagi requests agregatlari bo'yicha oxirgi 7 kun.",
             values=values,
             labels=daily["labels"],
             color_var="var(--primary)",
@@ -2262,7 +2310,7 @@ def _build_detail_page(metric_key: str, query: dict[str, list[str]]) -> str | No
                 ("Bugun", _format_number(values[-1] if values else 0)),
                 ("Jami tarixiy request", _format_number(summary["total_requests"])),
             ],
-            note="Bu sahifada individual requestlar emas, faqat 7 kunlik aniq agregat saqlanadi.",
+            note="Bu sahifada individual requestlar emas, event vaqtida yozilgan kunlik agregatlar ko'rsatiladi.",
             auth_query=auth_query,
             footer_html=footer_html,
         )
@@ -2278,7 +2326,7 @@ def _build_detail_page(metric_key: str, query: dict[str, list[str]]) -> str | No
         )
         return _build_aggregate_detail_page(
             title="Kontent faolligi 7 kun",
-            description="Daily stats jadvalidagi movie views agregatlari bo'yicha 7 kunlik kesim.",
+            description="daily_stats jadvalidagi movie_views agregatlari bo'yicha oxirgi 7 kun.",
             values=values,
             labels=daily["labels"],
             color_var="var(--secondary)",
@@ -2287,7 +2335,7 @@ def _build_detail_page(metric_key: str, query: dict[str, list[str]]) -> str | No
                 ("Bugun", _format_number(values[-1] if values else 0)),
                 ("Jami ko'rishlar", _format_number(summary["total_views"])),
             ],
-            note="Ko'rishlar bo'yicha user-level tarix alohida saqlanmaydi, shu sabab bu sahifa aniq agregat ko'rinishini beradi.",
+            note="Kunlik ko'rishlar event vaqtida daily_stats ga yoziladi; user kesimida tekshirish uchun Top kinolar sahifasidagi Unique user ustunidan foydalaning.",
             auth_query=auth_query,
             footer_html=footer_html,
         )
@@ -2318,17 +2366,16 @@ def _build_dashboard_page(
     top_movies_href = escape(_build_detail_href("top-movies", auth_query), quote=True)
     recent_users_href = escape(_build_detail_href("recent-users", auth_query), quote=True)
 
-    total_req = summary["total_requests"] or 1
-    completed_pct = int((summary["completed_requests"] / total_req) * 100)
-    pending_pct = int((summary["pending_requests"] / total_req) * 100)
-    rejected_pct = max(0, 100 - completed_pct - pending_pct)
-    if (
-        summary["completed_requests"]
-        + summary["pending_requests"]
-        + summary["rejected_requests"]
-        == 0
-    ):
-        completed_pct, pending_pct, rejected_pct = 0, 0, 0
+    pipeline = _request_pipeline_counts(summary)
+    completed_pct = pipeline["completed_pct"]
+    pending_pct = pipeline["pending_pct"]
+    rejected_pct = pipeline["rejected_pct"]
+    other_requests = pipeline["other"]
+    other_status_note = (
+        f'<div class="text-sm text-dim" style="margin-top:12px;">Boshqa statuslar pipeline foiziga kiritilmadi: {_format_number(other_requests)} ta.</div>'
+        if other_requests
+        else ""
+    )
 
     return """<!DOCTYPE html>
 <html lang="uz">
@@ -2421,17 +2468,17 @@ def _build_dashboard_page(
             <a class="card metric-box panel-link" href="{active_subscribers_href}">
                 <div class="metric-title">Faol Obunachilar</div>
                 <div class="metric-val c-primary">{total_users}</div>
-                <div class="metric-sub text-dim">Hozir botni bloklamagan foydalanuvchilar</div>
+                <div class="metric-sub text-dim">Hozir botni bloklamagan userlar</div>
             </a>
             <a class="card metric-box panel-link" href="{all_users_href}">
                 <div class="metric-title">Jami Kirganlar</div>
                 <div class="metric-val">{all_time_users}</div>
-                <div class="metric-sub text-dim">Bot ochilgandan beri kirgan barcha userlar</div>
+                <div class="metric-sub text-dim">Admin/helperlardan tashqari barcha userlar</div>
             </a>
             <a class="card metric-box panel-link" href="{entered_today_href}">
                 <div class="metric-title">Bugun Kirganlar</div>
                 <div class="metric-val c-success">{entered_today}</div>
-                <div class="metric-sub text-dim">Bugun botga kirganlar, bloklaganlar ham kiradi</div>
+                <div class="metric-sub text-dim">Bugun oxirgi faolligi bor userlar</div>
             </a>
             <a class="card metric-box panel-link" href="{new_users_today_href}">
                 <div class="metric-title">Bugun Yangi Obunachi</div>
@@ -2446,11 +2493,11 @@ def _build_dashboard_page(
             <a class="card metric-box panel-link" href="{active_today_href}" style="border-color: rgba(245, 158, 11, 0.3);">
                 <div class="metric-title" style="color: var(--warning)">24 Soat Faol</div>
                 <div class="metric-val c-warning">{active_today}</div>
-                <div class="metric-sub text-dim">7 kun faol: <span style="color:var(--text-main)">{active_week}</span></div>
+                <div class="metric-sub text-dim">So'nggi 24 soat, bloklamaganlar<br>7 kun faol: <span style="color:var(--text-main)">{active_week}</span></div>
             </a>
         </div>
         <a class="card panel-link fade-in" href="{requests_overview_href}" style="animation-delay: 0.2s; margin-bottom: 24px;">
-            <h2>📊 So'rovlar Volyumi (Pipeline)</h2>
+            <h2>So'rovlar pipeline</h2>
             <div class="flex justify-between items-center text-sm">
                 <span class="text-dim">Jami kelib tushgan so'rovlar: <strong style="color:var(--text-main); font-size:16px;">{total_requests}</strong> ta</span>
             </div>
@@ -2464,30 +2511,31 @@ def _build_dashboard_page(
                 <div><div class="dot" style="background: var(--warning);"></div> {pending_requests} Navbatda ({pending_pct}%)</div>
                 <div><div class="dot" style="background: var(--accent);"></div> {rejected_requests} Rad etilgan ({rejected_pct}%)</div>
             </div>
+            {other_status_note}
         </a>
         <div class="grid grid-cols-2">
             <a class="card panel-link fade-in" href="{requests_7d_href}" style="animation-delay: 0.3s;">
-                <h2>📈 Ohirgi 7 kun Murojaatlar</h2>
-                <div class="text-sm text-dim">So'rovlar (Requests) kunlik kelish grafikasi</div>
+                <h2>Oxirgi 7 kun murojaatlar</h2>
+                <div class="text-sm text-dim">daily_stats jadvalidagi requests agregati</div>
                 <div class="chart">
                     {requests_bars}
                 </div>
             </a>
             <a class="card panel-link fade-in" href="{content_activity_7d_href}" style="animation-delay: 0.4s;">
-                <h2>👁️ Kontent Faolligi</h2>
-                <div class="text-sm text-dim">7 kun ichida kinolar ko'rilishi trendi</div>
+                <h2>Kontent faolligi</h2>
+                <div class="text-sm text-dim">daily_stats jadvalidagi movie_views agregati</div>
                 <div class="chart">
                     {views_bars}
                 </div>
             </a>
             <a class="card panel-link fade-in" href="{top_movies_href}" style="animation-delay: 0.5s;">
-                <h2>🏆 Top Kinolar</h2>
+                <h2>Top kinolar</h2>
                 <div>
                     {top_movies_html}
                 </div>
             </a>
             <a class="card panel-link fade-in" href="{recent_users_href}" style="animation-delay: 0.6s;">
-                <h2>👥 Yaqinda faol bo'lganlar</h2>
+                <h2>Yaqinda faol bo'lganlar</h2>
                 <div>
                     {recent_users_html}
                 </div>
@@ -2512,6 +2560,7 @@ def _build_dashboard_page(
         pending_requests=_format_number(summary["pending_requests"]),
         completed_requests=_format_number(summary["completed_requests"]),
         rejected_requests=_format_number(summary["rejected_requests"]),
+        other_status_note=other_status_note,
         completed_pct=completed_pct,
         pending_pct=pending_pct,
         rejected_pct=rejected_pct,

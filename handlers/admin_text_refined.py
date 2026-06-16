@@ -286,16 +286,24 @@ def _build_dashboard_caption(panel: str, payload: dict) -> str:
     summary = payload["summary"]
     trends = payload["trends"]
     updated_at = f"{admin.local_now_text()} {admin.APP_TIMEZONE_LABEL}"
+    known_request_total = (
+        summary["pending_requests"]
+        + summary["completed_requests"]
+        + summary["rejected_requests"]
+    )
+    other_requests = max(0, summary["total_requests"] - known_request_total)
+    other_requests_text = f" | Boshqa: {other_requests}" if other_requests else ""
 
     if panel == "overview":
         return (
-            "📊 Statistika\n"
+            "Statistika\n"
             f"Yangilandi: {updated_at}\n\n"
-            f"Faol obunachilar: {summary['total_users']} | Jami kirgan: {summary['all_time_users']} | Bugun kirgan: {summary['entered_today']}\n"
+            f"Faol obunachilar: {summary['total_users']} (bloklamaganlar) | Jami kirgan: {summary['all_time_users']} (admin/helperlarsiz)\n"
+            f"Bugun kirgan: {summary['entered_today']} (bugungi oxirgi faollik)\n"
             f"Bugun yangi obunachi: {summary['new_subscribers_today']} | Bloklaganlar: {summary['blocked_users']}\n"
-            f"Faollik: 24 soat {summary['active_today']} | 7 kun {summary['active_week']}\n"
+            f"Faollik: 24 soat {summary['active_today']} (bloklamaganlar) | 7 kun {summary['active_week']}\n"
             f"Kontent: {summary['total_movies']} | Ko'rishlar: {summary['total_views']} | Sevimlilar: {summary['total_favorites']}\n"
-            f"So'rovlar: {summary['total_requests']} | Ochiq: {summary['pending_requests']} | Tayyor: {summary['completed_requests']} | Rad: {summary['rejected_requests']}\n\n"
+            f"So'rovlar: {summary['total_requests']} | Ochiq: {summary['pending_requests']} | Tayyor: {summary['completed_requests']} | Rad: {summary['rejected_requests']}{other_requests_text}\n\n"
             "7 kunlik trend\n"
             f"• So'rovlar: {admin._sparkline(trends['requests'])}\n"
             f"• Ko'rishlar: {admin._sparkline(trends['movie_views'])}\n"
@@ -307,7 +315,7 @@ def _build_dashboard_caption(panel: str, payload: dict) -> str:
     if panel == "traffic":
         labels = " ".join(label[8:] for label in trends["labels"])
         return (
-            "📈 Trafik\n"
+            "Trafik\n"
             f"Yangilandi: {updated_at}\n\n"
             f"Kunlar: {labels}\n\n"
             f"So'rovlar  {admin._sparkline(trends['requests'])}   {' '.join(admin._compact_number(v) for v in trends['requests'])}\n"
@@ -323,14 +331,16 @@ def _build_dashboard_caption(panel: str, payload: dict) -> str:
         if not top_movies:
             ranking = "Hali ma'lumot yo'q."
         else:
-            max_views = max(views for _, _, views in top_movies)
+            max_views = max(views for _, _, views, _ in top_movies)
+            views_label = "Ko'rish"
             ranking = "\n".join(
-                f"{index}. {title} ({code})\n{admin._bar_chart('Korish', views, max_views)}"
-                for index, (code, title, views) in enumerate(top_movies, start=1)
+                f"{index}. {title} ({code})\n"
+                f"{admin._bar_chart(views_label, views, max_views)} • Unique user: {unique_views}"
+                for index, (code, title, views, unique_views) in enumerate(top_movies, start=1)
             )
 
         return (
-            "🎬 Kontent statistikasi\n"
+            "Kontent statistikasi\n"
             f"Yangilandi: {updated_at}\n\n"
             f"Jami kontent: {summary['total_movies']}\n"
             f"Jami ko'rishlar: {summary['total_views']}\n"
@@ -341,16 +351,28 @@ def _build_dashboard_caption(panel: str, payload: dict) -> str:
 
     request_counts = payload["request_counts"]
     maximum = max(request_counts.values()) if request_counts else 0
+    other_status_line = (
+        f"{admin._bar_chart('Boshqa', request_counts.get('other', 0), maximum)}\n"
+        if request_counts.get("other", 0)
+        else ""
+    )
+    other_status_summary = (
+        f"\nBoshqa status jami: {request_counts.get('other', 0)}"
+        if request_counts.get("other", 0)
+        else ""
+    )
     return (
-        "📩 So'rovlar statistikasi\n"
+        "So'rovlar statistikasi\n"
         f"Yangilandi: {updated_at}\n\n"
         f"{admin._bar_chart('Yangi', request_counts.get('pending', 0), maximum)}\n"
         f"{admin._bar_chart('Jarayonda', request_counts.get('accepted', 0), maximum)}\n"
         f"{admin._bar_chart('Tayyor', request_counts.get('completed', 0), maximum)}\n"
-        f"{admin._bar_chart('Rad', request_counts.get('rejected', 0), maximum)}\n\n"
+        f"{admin._bar_chart('Rad', request_counts.get('rejected', 0), maximum)}\n"
+        f"{other_status_line}\n"
         f"Ochiq: {summary['pending_requests']}\n"
         f"Tayyor: {summary['completed_requests']}\n"
         f"Rad: {summary['rejected_requests']}"
+        f"{other_status_summary}"
     )
 
 
@@ -753,13 +775,13 @@ async def _show_stats_webapp_restored(message: types.Message) -> None:
     summary = await admin.get_dashboard_summary()
     stats_url = _runtime_stats_webapp_url()
     text = (
-        "📊 Premium statistika\n"
-        f"• Faol obunachilar: {summary['total_users']}\n"
-        f"• Jami kirganlar: {summary['all_time_users']}\n"
-        f"• Bugun kirganlar: {summary['entered_today']}\n"
+        "Premium statistika\n"
+        f"• Faol obunachilar: {summary['total_users']} (bloklamaganlar)\n"
+        f"• Jami kirganlar: {summary['all_time_users']} (admin/helperlarsiz)\n"
+        f"• Bugun kirganlar: {summary['entered_today']} (bugungi oxirgi faollik)\n"
         f"• Bugun yangi obunachilar: {summary['new_subscribers_today']}\n"
         f"• Bloklaganlar: {summary['blocked_users']}\n"
-        f"• 24 soat faol: {summary['active_today']}\n"
+        f"• 24 soat faol: {summary['active_today']} (bloklamaganlar)\n"
         f"• 7 kun faol: {summary['active_week']}\n"
         f"• Jami kontent: {summary['total_movies']}\n"
         f"• Ko'rishlar: {summary['total_views']}\n"

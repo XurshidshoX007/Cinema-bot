@@ -3,7 +3,7 @@ import shutil
 import sqlite3
 import re
 import shutil
-from contextlib import suppress
+from contextlib import closing, suppress
 from datetime import UTC, datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 from time import monotonic
@@ -952,6 +952,12 @@ async def init_db() -> None:
 
     await db.execute("CREATE INDEX IF NOT EXISTS idx_movies_code ON movies(code)")
     await db.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_movies_admin_serial_order
+        ON movies(content_kind, series_title, episode_number, id)
+        """
+    )
+    await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_requests_status ON requests(status)"
     )
     await db.execute("CREATE INDEX IF NOT EXISTS idx_fav_user ON favorites(user_id)")
@@ -1760,7 +1766,26 @@ async def get_all_movies() -> list[tuple[str, str, str]]:
             series_title,
             episode_number
         FROM movies
-        ORDER BY id DESC
+        ORDER BY
+            CASE WHEN COALESCE(content_kind, 'movie') = 'serial' THEN 1 ELSE 0 END,
+            CASE
+                WHEN COALESCE(content_kind, 'movie') = 'serial'
+                THEN COALESCE(NULLIF(series_title, ''), title)
+            END COLLATE NOCASE ASC,
+            CASE
+                WHEN COALESCE(content_kind, 'movie') = 'serial'
+                     AND COALESCE(episode_number, 0) > 0
+                THEN 0
+                WHEN COALESCE(content_kind, 'movie') = 'serial'
+                THEN 1
+                ELSE 0
+            END ASC,
+            CASE
+                WHEN COALESCE(content_kind, 'movie') = 'serial'
+                THEN COALESCE(episode_number, 0)
+            END ASC,
+            CASE WHEN COALESCE(content_kind, 'movie') = 'serial' THEN id END ASC,
+            CASE WHEN COALESCE(content_kind, 'movie') != 'serial' THEN id END DESC
         """) as cursor:
         rows = await cursor.fetchall()
 
@@ -2438,10 +2463,10 @@ async def delete_request(request_id: int) -> None:
     await _execute("DELETE FROM requests WHERE id=?", (request_id,))
 
 
-def _open_snapshot_connection() -> sqlite3.Connection:
+def _open_snapshot_connection() -> closing[sqlite3.Connection]:
     connection = sqlite3.connect(DB_PATH, timeout=5, check_same_thread=False)
     connection.row_factory = sqlite3.Row
-    return connection
+    return closing(connection)
 
 
 def _has_users_block_tracking_sync(connection: sqlite3.Connection) -> bool:
@@ -2572,6 +2597,7 @@ def get_request_status_counts_snapshot() -> dict[str, int]:
         "accepted": 0,
         "completed": 0,
         "rejected": 0,
+        "other": 0,
     }
     if not DB_PATH.exists():
         return counts
@@ -2593,6 +2619,8 @@ def get_request_status_counts_snapshot() -> dict[str, int]:
         status = str(row["status"] or "").strip().lower()
         if status in counts:
             counts[status] = int(row["total"] or 0)
+        else:
+            counts["other"] += int(row["total"] or 0)
     return counts
 
 
@@ -2612,35 +2640,43 @@ def get_daily_metric_series_snapshot(days: int = 7) -> dict[str, list[int]]:
             SELECT day, metric, value
             FROM daily_stats
             WHERE day >= ?
-              AND metric IN (?, ?)
+              AND metric IN (?, ?, ?)
             ORDER BY day ASC
             """,
-            (labels[0], "requests", "movie_views"),
-        ).fetchall()
-        new_user_rows = connection.execute(
-            f"""
-            SELECT SUBSTR(first_seen, 1, 10) AS day, COUNT(*) AS total
-            FROM users
-            WHERE first_seen IS NOT NULL
-              AND SUBSTR(first_seen, 1, 10) >= ?
-              AND {_base_actor_filter()}
-            GROUP BY SUBSTR(first_seen, 1, 10)
-            ORDER BY day ASC
-            """,
-            (labels[0], ADMIN_ID),
+            (labels[0], "requests", "movie_views", "new_users"),
         ).fetchall()
 
     label_index = {label: index for index, label in enumerate(labels)}
+    seen_new_user_days: set[str] = set()
     for row in rows:
         day = str(row["day"] or "")
         metric = str(row["metric"] or "")
         if day in label_index and metric in series:
             series[metric][label_index[day]] = int(row["value"] or 0)
+            if metric == "new_users":
+                seen_new_user_days.add(day)
 
-    for row in new_user_rows:
-        day = str(row["day"] or "")
-        if day in label_index:
-            series["new_users"][label_index[day]] = int(row["total"] or 0)
+    missing_new_user_days = [label for label in labels if label not in seen_new_user_days]
+    if missing_new_user_days:
+        placeholders = _placeholders(missing_new_user_days)
+        with _open_snapshot_connection() as connection:
+            new_user_rows = connection.execute(
+                f"""
+                SELECT SUBSTR(first_seen, 1, 10) AS day, COUNT(*) AS total
+                FROM users
+                WHERE first_seen IS NOT NULL
+                  AND SUBSTR(first_seen, 1, 10) IN ({placeholders})
+                  AND {_base_actor_filter()}
+                GROUP BY SUBSTR(first_seen, 1, 10)
+                ORDER BY day ASC
+                """,
+                (*missing_new_user_days, ADMIN_ID),
+            ).fetchall()
+
+        for row in new_user_rows:
+            day = str(row["day"] or "")
+            if day in label_index:
+                series["new_users"][label_index[day]] = int(row["total"] or 0)
 
     return {"labels": labels, **series}
 
