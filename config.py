@@ -153,8 +153,6 @@ def is_telegram_compatible_stats_webapp_url(url: str) -> bool:
 
 STATS_WEBAPP_URL = get_stats_webapp_url()
 
-import json
-
 
 def _parse_sponsor_channels() -> list[dict]:
     raw = _get_env_optional("SPONSOR_CHANNELS", "[]")

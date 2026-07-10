@@ -45,8 +45,10 @@ from repositories.content import (
     get_serial_episodes,
     get_serial_group_for_lookup,
     is_favorite,
+    log_user_search_event,
     record_movie_view,
 )
+from repositories.channels import get_sponsor_channels
 from repositories.requests import add_request
 from repositories.users import has_feature_trial_used, is_admin_user, mark_feature_trial_used
 from services.legacy_media import (
@@ -83,6 +85,7 @@ CODE_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]+")
 SERIAL_DESCRIPTION_LIMIT = 760
 SERIAL_TITLE_LIMIT = 120
 SERIAL_INLINE_LIMIT = 96
+CHANNEL_SHARE_BUTTON_LIMIT = 96
 
 # code, episode_number, description, file_id, item_type, season_number, item_title
 SerialTimelineItem = tuple[str, int, str, str, str, int | None, str]
@@ -94,6 +97,7 @@ _runtime_video_preview_cache: dict[str, tuple[str, str]] = {}
 async def _should_protect_content(user_id: int) -> bool:
     return not await is_admin_user(user_id)
 SHARE_CALLBACK_PREFIX = "share:"
+CHANNEL_SHARE_CALLBACK_PREFIX = "sharech:"
 SHARE_QUERY_PREFIX = "share:"
 DEEP_LINK_WATCH_PREFIX = "watch_"
 _bot_username_cache: str | None = None
@@ -191,7 +195,14 @@ async def _serial_hub_reply_markup(
 ) -> types.InlineKeyboardMarkup:
     current_page, total_pages, visible = _serial_page_payload(episodes, page)
     is_fav = await is_favorite(user_id, group_code)
-    share_query = _build_inline_share_query(group_code)
+    share_query = None
+    share_callback_data = _build_share_callback_data(group_code)
+    share_button_text = "🔗 Ulashish"
+    channel_callback_data = None
+    candidate_callback_data = f"{CHANNEL_SHARE_CALLBACK_PREFIX}{group_code}"
+    if await is_admin_user(user_id) and len(candidate_callback_data.encode("utf-8")) <= 64:
+        channel_callback_data = candidate_callback_data
+
     return serial_hub_keyboard(
         group_code,
         [
@@ -202,6 +213,9 @@ async def _serial_hub_reply_markup(
         total_pages=total_pages,
         is_fav=is_fav,
         share_query=share_query,
+        share_callback_data=share_callback_data,
+        share_button_text=share_button_text,
+        channel_callback_data=channel_callback_data,
     )
 
 
@@ -328,16 +342,16 @@ def _extract_lookup_code(raw_text: str | None) -> str:
 
     tokens = CODE_TOKEN_RE.findall(value)
     if not tokens:
-        return value
+        return value[:256]  # Prevent excessively long inputs
 
     if len(tokens) == 1:
-        return tokens[0]
+        return tokens[0][:256]
 
     numeric_tokens = [token for token in tokens if token.isdigit()]
     if numeric_tokens:
-        return max(numeric_tokens, key=len)
+        return max(numeric_tokens, key=len)[:256]
 
-    return tokens[0]
+    return tokens[0][:256]
 
 
 async def _bot_username(bot: Bot) -> str | None:
@@ -473,6 +487,75 @@ async def _build_share_message(
         lines.extend(["", safe_description])
 
     return "\n".join(lines), deep_link
+
+
+async def _build_admin_serial_share_keyboard(
+    *,
+    bot: Bot,
+    group_code: str,
+    deep_link: str,
+    channel_callback_data: str | None = None,
+) -> types.InlineKeyboardMarkup | None:
+    group = await get_serial_group_for_lookup(group_code)
+    if group is None:
+        return None
+
+    resolved_group_code, group_title, _group_description = group
+    username = await _bot_username(bot)
+    if not username:
+        return None
+
+    group_deep_link = (
+        f"https://t.me/{username}?start="
+        f"{DEEP_LINK_WATCH_PREFIX}{quote(resolved_group_code, safe='')}"
+    )
+    _base_title, timeline_items, multi_season = await _build_serial_timeline(
+        group_code=resolved_group_code,
+        group_title=group_title,
+    )
+
+    rows: list[list[types.InlineKeyboardButton]] = []
+    current_row: list[types.InlineKeyboardButton] = []
+    for item in timeline_items[:CHANNEL_SHARE_BUTTON_LIMIT]:
+        item_code = item[0]
+        item_type = item[4]
+        season_number = item[5]
+        label = _timeline_item_label(item, multi_season=multi_season)
+        if multi_season and item_type == "episode" and season_number is not None:
+            label = f"{season_number}-fasl {label}"
+
+        item_link = (
+            f"https://t.me/{username}?start="
+            f"{DEEP_LINK_WATCH_PREFIX}{quote(item_code, safe='')}"
+        )
+        current_row.append(
+            types.InlineKeyboardButton(
+                text=label,
+                url=item_link,
+            )
+        )
+        if len(current_row) == 4:
+            rows.append(current_row)
+            current_row = []
+
+    if current_row:
+        rows.append(current_row)
+
+    action_row = [
+        types.InlineKeyboardButton(
+            text="▶️ Botda ko'rish",
+            url=group_deep_link or deep_link,
+        )
+    ]
+    if channel_callback_data:
+        action_row.append(
+            types.InlineKeyboardButton(
+                text="📣 Kanalga yuborish",
+                callback_data=channel_callback_data,
+            )
+        )
+    rows.append(action_row)
+    return types.InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _season_timeline_items(
@@ -860,7 +943,14 @@ async def _timeline_hub_reply_markup(
         back_to_group_code = None
 
     is_fav = await is_favorite(user_id, group_code)
-    share_query = _build_inline_share_query(group_code)
+    share_query = None
+    share_callback_data = _build_share_callback_data(group_code)
+    share_button_text = "🔗 Ulashish"
+    channel_callback_data = None
+    candidate_callback_data = f"{CHANNEL_SHARE_CALLBACK_PREFIX}{group_code}"
+    if await is_admin_user(user_id) and len(candidate_callback_data.encode("utf-8")) <= 64:
+        channel_callback_data = candidate_callback_data
+
     return serial_hub_keyboard(
         current_group_ref,
         visible,
@@ -872,6 +962,9 @@ async def _timeline_hub_reply_markup(
         back_to_page=0,
         back_text="⬅️ Fasllar",
         share_query=share_query,
+        share_callback_data=share_callback_data,
+        share_button_text=share_button_text,
+        channel_callback_data=channel_callback_data,
     )
 
 
@@ -1124,6 +1217,14 @@ async def _send_movie_by_code(
 
     try:
         if await _send_serial_entry(message, user_id=user_id, raw_code=code):
+            await log_user_search_event(
+                user_id=user_id,
+                raw_query=raw_code,
+                normalized_code=code,
+                resolved_code=code,
+                result_status="serial",
+                content_kind="serial",
+            )
             if clear_state and state is not None:
                 await state.clear()
             return
@@ -1137,6 +1238,14 @@ async def _send_movie_by_code(
         await message.answer(
             "Ushbu serial qismini yuborib bo'lmadi. Iltimos, keyinroq urinib ko'ring."
         )
+        await log_user_search_event(
+            user_id=user_id,
+            raw_query=raw_code,
+            normalized_code=code,
+            resolved_code=code,
+            result_status="error",
+            content_kind="serial",
+        )
         if clear_state and state is not None:
             await state.clear()
         return
@@ -1144,6 +1253,14 @@ async def _send_movie_by_code(
     movie = await get_movie(code)
     if not movie:
         await message.answer("Hech narsa topilmadi.")
+        await log_user_search_event(
+            user_id=user_id,
+            raw_query=raw_code,
+            normalized_code=code,
+            resolved_code=None,
+            result_status="not_found",
+            content_kind=None,
+        )
         if clear_state and state is not None:
             await state.clear()
         return
@@ -1214,6 +1331,14 @@ async def _send_movie_by_code(
                     await message.answer(
                         "Kontentni yuborib bo'lmadi. Iltimos, keyinroq urinib ko'ring."
                     )
+                    await log_user_search_event(
+                        user_id=user_id,
+                        raw_query=raw_code,
+                        normalized_code=code,
+                        resolved_code=code,
+                        result_status="error",
+                        content_kind=content_kind,
+                    )
                     if clear_state and state is not None:
                         await state.clear()
                     return
@@ -1242,6 +1367,14 @@ async def _send_movie_by_code(
                 await message.answer(
                     "Kontentni yuborib bo'lmadi. Iltimos, keyinroq urinib ko'ring."
                 )
+                await log_user_search_event(
+                    user_id=user_id,
+                    raw_query=raw_code,
+                    normalized_code=code,
+                    resolved_code=code,
+                    result_status="error",
+                    content_kind=content_kind,
+                )
                 if clear_state and state is not None:
                     await state.clear()
                 return
@@ -1254,6 +1387,14 @@ async def _send_movie_by_code(
         )
 
     await record_movie_view(code, viewer_user_id=user_id)
+    await log_user_search_event(
+        user_id=user_id,
+        raw_query=raw_code,
+        normalized_code=code,
+        resolved_code=code,
+        result_status="movie",
+        content_kind=content_kind,
+    )
     await add_history(user_id, code)
     if clear_state and state is not None:
         await state.clear()
@@ -1448,22 +1589,146 @@ async def share_content_callback(callback: types.CallbackQuery) -> None:
         return
 
     share_text, deep_link = payload
+    reply_markup = types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                types.InlineKeyboardButton(
+                    text="▶️ Botda ko'rish",
+                    url=deep_link,
+                )
+            ]
+        ]
+    )
+
+    share_payload = await _resolve_share_payload(raw_code)
+    if (
+        share_payload is not None
+        and share_payload[3] == "serial"
+        and await is_admin_user(callback.from_user.id)
+    ):
+        channel_callback_data = None
+        channel_code = share_payload[0]
+        candidate_callback_data = f"{CHANNEL_SHARE_CALLBACK_PREFIX}{channel_code}"
+        if len(candidate_callback_data.encode("utf-8")) <= 64:
+            channel_callback_data = candidate_callback_data
+
+        serial_reply_markup = await _build_admin_serial_share_keyboard(
+            bot=callback.bot,
+            group_code=channel_code,
+            deep_link=deep_link,
+            channel_callback_data=channel_callback_data,
+        )
+        if serial_reply_markup is not None:
+            reply_markup = serial_reply_markup
+
     await callback.message.answer(
         share_text,
         parse_mode="HTML",
         disable_web_page_preview=False,
-        reply_markup=types.InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    types.InlineKeyboardButton(
-                        text="▶️ Botda ko'rish",
-                        url=deep_link,
-                    )
-                ]
-            ]
-        ),
+        reply_markup=reply_markup,
     )
-    await callback.answer("Ulashish xabari tayyor. Forward qiling.")
+    await callback.answer("Ulashish xabari tayyor.")
+
+
+@router.callback_query(F.data.startswith(CHANNEL_SHARE_CALLBACK_PREFIX))
+async def send_serial_share_to_channel(callback: types.CallbackQuery) -> None:
+    await touch_callback_user(callback)
+    if not await is_admin_user(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+
+    raw_code = (callback.data or "")[len(CHANNEL_SHARE_CALLBACK_PREFIX) :].strip()
+    if not raw_code:
+        await callback.answer("Serial topilmadi", show_alert=True)
+        return
+
+    payload = await _resolve_share_payload(raw_code)
+    if payload is None or payload[3] != "serial":
+        await callback.answer("Serial topilmadi", show_alert=True)
+        return
+
+    share_message = await _build_share_message(bot=callback.bot, raw_code=payload[0])
+    if share_message is None:
+        await callback.answer("Serial topilmadi", show_alert=True)
+        return
+
+    share_text, deep_link = share_message
+    reply_markup = await _build_admin_serial_share_keyboard(
+        bot=callback.bot,
+        group_code=payload[0],
+        deep_link=deep_link,
+    )
+    if reply_markup is None:
+        await callback.answer("Inline tugmalar tayyorlanmadi", show_alert=True)
+        return
+
+    channels = await get_sponsor_channels()
+    if not channels:
+        await callback.answer("Kanal qo'shilmagan", show_alert=True)
+        return
+
+    sent_count = 0
+    failed_names: list[str] = []
+    for channel in channels:
+        chat_id = str(channel.get("id") or "").strip()
+        channel_name = str(channel.get("name") or chat_id or "Kanal")
+        if not chat_id:
+            failed_names.append(channel_name)
+            continue
+        try:
+            if callback.message is not None:
+                await callback.bot.copy_message(
+                    chat_id=chat_id,
+                    from_chat_id=callback.message.chat.id,
+                    message_id=callback.message.message_id,
+                    reply_markup=reply_markup,
+                )
+            else:
+                await callback.bot.send_message(
+                    chat_id=chat_id,
+                    text=share_text,
+                    parse_mode="HTML",
+                    disable_web_page_preview=False,
+                    reply_markup=reply_markup,
+                )
+            sent_count += 1
+        except TelegramBadRequest as error:
+            logger.warning(
+                "Serial share copy kanalga yuborilmadi, text fallback uriniladi: channel=%s code=%s error=%s",
+                chat_id,
+                payload[0],
+                error,
+            )
+            try:
+                await callback.bot.send_message(
+                    chat_id=chat_id,
+                    text=share_text,
+                    parse_mode="HTML",
+                    disable_web_page_preview=False,
+                    reply_markup=reply_markup,
+                )
+                sent_count += 1
+            except TelegramBadRequest as fallback_error:
+                logger.warning(
+                    "Serial share kanalga yuborilmadi: channel=%s code=%s error=%s",
+                    chat_id,
+                    payload[0],
+                    fallback_error,
+                )
+                failed_names.append(channel_name)
+
+    if sent_count and not failed_names:
+        await callback.answer(f"{sent_count} ta kanalga yuborildi.")
+    elif sent_count:
+        await callback.answer(
+            f"{sent_count} ta kanalga yuborildi, {len(failed_names)} tasida xato.",
+            show_alert=True,
+        )
+    else:
+        await callback.answer(
+            "Kanalga yuborilmadi. Bot kanalga admin qilinganini tekshiring.",
+            show_alert=True,
+        )
 
 
 @router.callback_query(F.data.startswith(f"{FAVORITES_PAGE_PREFIX}_"))

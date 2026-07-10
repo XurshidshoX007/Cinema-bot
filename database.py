@@ -2,7 +2,6 @@ import asyncio
 import shutil
 import sqlite3
 import re
-import shutil
 from contextlib import closing, suppress
 from datetime import UTC, datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
@@ -242,6 +241,57 @@ async def _ensure_movie_views_columns(connection: aiosqlite.Connection) -> None:
         """
     )
     await connection.commit()
+
+
+async def _ensure_stats_event_tables(connection: aiosqlite.Connection) -> None:
+    await connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS content_view_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            code TEXT NOT NULL,
+            viewed_at TEXT NOT NULL
+        )
+        """
+    )
+    await connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_search_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            raw_query TEXT,
+            normalized_code TEXT,
+            resolved_code TEXT,
+            result_status TEXT NOT NULL,
+            content_kind TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    await connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_content_view_events_viewed_at
+        ON content_view_events(viewed_at, code)
+        """
+    )
+    await connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_content_view_events_user_time
+        ON content_view_events(user_id, viewed_at)
+        """
+    )
+    await connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_user_search_events_user_time
+        ON user_search_events(user_id, created_at)
+        """
+    )
+    await connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_user_search_events_time_status
+        ON user_search_events(created_at, result_status)
+        """
+    )
 
 
 def _visible_user_filter(
@@ -878,6 +928,7 @@ async def init_db() -> None:
             UNIQUE(day, metric)
         )
         """)
+    await _ensure_stats_event_tables(db)
     await db.execute("""
         CREATE TABLE IF NOT EXISTS ads (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -980,6 +1031,7 @@ async def init_db() -> None:
     await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_movie_unique_views_user ON movie_unique_views(user_id)"
     )
+    await _ensure_stats_event_tables(db)
     await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_ads_status_expires ON ads(status, expires_at)"
     )
@@ -1267,6 +1319,18 @@ async def mark_user_blocked(
     user_activity_cache.pop(user_id, None)
 
 
+async def delete_blocked_users() -> int:
+    connection = _get_db()
+    await _ensure_users_tracking_columns(connection)
+    cursor = await connection.execute(
+        "DELETE FROM users WHERE COALESCE(is_blocked, 0) = 1"
+    )
+    await connection.commit()
+    user_activity_cache.clear()
+    view_tracking_exclusion_cache.clear()
+    return int(cursor.rowcount or 0)
+
+
 async def has_feature_trial_used(user_id: int, feature: str) -> bool:
     connection = _get_db()
     async with connection.execute(
@@ -1469,7 +1533,15 @@ async def record_movie_view(
 
     connection = _get_db()
     await _ensure_movie_views_columns(connection)
+    await _ensure_stats_event_tables(connection)
     now_text = _format_timestamp()
+    await connection.execute(
+        """
+        INSERT INTO content_view_events (user_id, code, viewed_at)
+        VALUES (?, ?, ?)
+        """,
+        (viewer_user_id, code, now_text),
+    )
     insert_cursor = await connection.execute(
         """
         INSERT OR IGNORE INTO movie_unique_views (code, user_id, first_viewed_at)
@@ -1494,6 +1566,46 @@ async def record_movie_view(
     await _increment_daily_stat("movie_views", connection=connection)
     await connection.commit()
     return True
+
+
+async def log_user_search_event(
+    *,
+    user_id: int,
+    raw_query: str | None,
+    normalized_code: str | None,
+    resolved_code: str | None,
+    result_status: str,
+    content_kind: str | None,
+) -> None:
+    if await _is_view_tracking_excluded(user_id):
+        return
+
+    connection = _get_db()
+    await _ensure_stats_event_tables(connection)
+    await connection.execute(
+        """
+        INSERT INTO user_search_events (
+            user_id,
+            raw_query,
+            normalized_code,
+            resolved_code,
+            result_status,
+            content_kind,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            (raw_query or "").strip(),
+            (normalized_code or "").strip() or None,
+            (resolved_code or "").strip() or None,
+            (result_status or "unknown").strip(),
+            (content_kind or "").strip() or None,
+            _format_timestamp(),
+        ),
+    )
+    await connection.commit()
 
 
 async def get_movie(code: str) -> tuple[str, str, str, str] | None:
@@ -2697,23 +2809,42 @@ async def get_top_viewed_movies(limit: int = 5) -> list[tuple[str, str, int, int
     connection = _get_db()
     async with connection.execute(
         """
+        WITH grouped_views AS (
+            SELECT
+                CASE
+                    WHEN COALESCE(m.content_kind, 'movie') = 'serial'
+                    THEN COALESCE(sg.code, COALESCE(NULLIF(m.series_title, ''), m.title), mv.code)
+                    ELSE mv.code
+                END AS item_code,
+                CASE
+                    WHEN COALESCE(m.content_kind, 'movie') = 'serial'
+                    THEN COALESCE(NULLIF(m.series_title, ''), m.title, 'Noma''lum serial')
+                    ELSE COALESCE(m.title, 'Noma''lum kino')
+                END AS display_title,
+                SUM(COALESCE(mv.views, 0)) AS views,
+                SUM(COALESCE(mv.unique_views, mv.views)) AS unique_views,
+                MAX(COALESCE(mv.last_viewed_at, '')) AS last_viewed_at
+            FROM movie_views mv
+            LEFT JOIN movies m ON m.code = mv.code
+            LEFT JOIN serial_groups sg
+              ON COALESCE(m.content_kind, 'movie') = 'serial'
+             AND sg.title = COALESCE(NULLIF(m.series_title, ''), m.title)
+            GROUP BY
+                CASE WHEN COALESCE(m.content_kind, 'movie') = 'serial' THEN 'serial' ELSE 'movie' END,
+                item_code,
+                display_title
+        )
         SELECT
-            mv.code,
-            CASE
-                WHEN COALESCE(m.content_kind, 'movie') = 'serial'
-                     AND COALESCE(m.episode_number, 0) > 0
-                THEN COALESCE(NULLIF(m.series_title, ''), m.title) || ' ' || m.episode_number || '-qism'
-                ELSE COALESCE(m.title, 'Noma''lum kino')
-            END,
-            mv.views,
-            COALESCE(mv.unique_views, mv.views) AS unique_views
-        FROM movie_views mv
-        LEFT JOIN movies m ON m.code = mv.code
+            item_code,
+            display_title,
+            views,
+            unique_views
+        FROM grouped_views
         ORDER BY
-            mv.views DESC,
+            views DESC,
             unique_views DESC,
-            COALESCE(mv.last_viewed_at, '') DESC,
-            mv.code ASC
+            last_viewed_at DESC,
+            item_code ASC
         LIMIT ?
         """,
         (limit,),

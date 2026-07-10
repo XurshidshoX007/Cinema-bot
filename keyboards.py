@@ -98,6 +98,9 @@ def _delete_button_text(code: str, title: str, content_kind: str) -> str:
                 parts.append(episode_part)
         if parts:
             return f"🗑 {code} - {' '.join(parts)}"
+        # Fallback for serial without season/episode info
+        short_title = title if len(title) <= 26 else f"{title[:23]}..."
+        return f"🗑 {code} - {short_title}"
 
     short_title = title if len(title) <= 26 else f"{title[:23]}..."
     return f"🗑 {code} - {short_title}"
@@ -599,7 +602,9 @@ def helper_admins_keyboard(
     ]
 
     for helper_admin in helper_admins:
-        user_id = int(helper_admin["user_id"])
+        user_id = int(helper_admin.get("user_id", 0) or 0)
+        if user_id <= 0:
+            continue
         full_name = str(helper_admin.get("full_name") or f"Admin {user_id}")
         username = helper_admin.get("username")
         label = f"@{username}" if username else full_name
@@ -726,6 +731,9 @@ def serial_hub_keyboard(
     share_url: str | None = None,
     share_query: str | None = None,
     share_callback_data: str | None = None,
+    share_button_text: str = "🔗 Ulashish",
+    channel_callback_data: str | None = None,
+    channel_button_text: str = "📣 Kanalga yuborish",
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     current_row: list[InlineKeyboardButton] = []
@@ -825,19 +833,26 @@ def serial_hub_keyboard(
     if share_callback_data:
         action_row.append(
             InlineKeyboardButton(
-                text="🔗 Ulashish",
+                text=share_button_text,
                 callback_data=share_callback_data,
             )
         )
     elif share_query:
         action_row.append(
             InlineKeyboardButton(
-                text="🔗 Ulashish",
+                text=share_button_text,
                 switch_inline_query=share_query,
             )
         )
     elif share_url:
-        action_row.append(InlineKeyboardButton(text="🔗 Ulashish", url=share_url))
+        action_row.append(InlineKeyboardButton(text=share_button_text, url=share_url))
+    if channel_callback_data:
+        action_row.append(
+            InlineKeyboardButton(
+                text=channel_button_text,
+                callback_data=channel_callback_data,
+            )
+        )
     rows.append(action_row)
 
     return InlineKeyboardMarkup(inline_keyboard=rows)

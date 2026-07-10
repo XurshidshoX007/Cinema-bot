@@ -21,6 +21,7 @@ sqlite3.register_converter("timestamp", lambda s: datetime.fromisoformat(s.decod
 
 from config import ADMIN_ID, BOT_TOKEN, get_stats_webapp_url
 from database import (
+    APP_TIMEZONE,
     APP_TIMEZONE_LABEL,
     DB_PATH,
     format_local_timestamp,
@@ -43,6 +44,7 @@ DEEP_LINK_WATCH_PREFIX = "watch_"
 SHARE_MEDIA_ROUTE_PREFIX = "/share-media/"
 SHARE_MEDIA_CACHE_TTL = 600
 DETAIL_ROUTE_PREFIX = "/details/"
+ACTION_ROUTE_PREFIX = "/actions/"
 DETAIL_PAGE_SIZE = 50
 MAX_DETAIL_SEARCH_LENGTH = 64
 REQUEST_STATUS_FILTERS = {
@@ -262,6 +264,13 @@ def _send_common_headers(
         handler.send_header("Content-Security-Policy", _content_security_policy())
 
 
+def _redirect(handler: BaseHTTPRequestHandler, location: str) -> None:
+    handler.send_response(303)
+    handler.send_header("Location", location)
+    handler.send_header("Cache-Control", "no-store")
+    handler.end_headers()
+
+
 def _send_bytes(
     handler: BaseHTTPRequestHandler,
     status: int,
@@ -427,6 +436,42 @@ def _users_block_filter(conn: sqlite3.Connection) -> str:
     return " AND COALESCE(is_blocked, 0) = 0 "
 
 
+def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    try:
+        return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
+    except sqlite3.Error:
+        return set()
+
+
+def _content_display_title_expr(alias: str = "m") -> str:
+    return (
+        "CASE "
+        f"WHEN COALESCE({alias}.content_kind, 'movie') = 'serial' "
+        f"AND COALESCE({alias}.episode_number, 0) > 0 "
+        f"THEN COALESCE(NULLIF({alias}.series_title, ''), {alias}.title) || ' ' || {alias}.episode_number || '-qism' "
+        f"ELSE COALESCE({alias}.title, 'Noma''lum kino') "
+        "END"
+    )
+
+
+def _content_group_title_expr(alias: str = "m") -> str:
+    return (
+        "CASE "
+        f"WHEN COALESCE({alias}.content_kind, 'movie') = 'serial' "
+        f"THEN COALESCE(NULLIF({alias}.series_title, ''), {alias}.title, 'Noma''lum serial') "
+        f"ELSE COALESCE({alias}.title, 'Noma''lum kino') "
+        "END"
+    )
+
+
 def _query_summary() -> dict[str, int]:
     return get_dashboard_summary_snapshot()
 
@@ -441,38 +486,39 @@ def _query_top_movies(limit: int = 5) -> list[tuple[str, str, int, int]]:
 
     with sqlite3.connect(DB_PATH, timeout=5, check_same_thread=False) as conn:
         conn.row_factory = sqlite3.Row
-        movie_view_columns = {
-            str(row[1]) for row in conn.execute("PRAGMA table_info(movie_views)").fetchall()
-        }
-        unique_views_expr = (
-            "COALESCE(mv.unique_views, mv.views)"
-            if "unique_views" in movie_view_columns
-            else "mv.views"
-        )
+        if _table_exists(conn, "movie_unique_views"):
+            unique_expr = "COUNT(DISTINCT muv.user_id)"
+            unique_join = "LEFT JOIN movie_unique_views muv ON muv.code = mv.code"
+        else:
+            unique_expr = "SUM(COALESCE(mv.unique_views, mv.views))"
+            unique_join = ""
+        group_title_expr = _content_group_title_expr("m")
         query = f"""
         SELECT
-            mv.code,
-            CASE
-                WHEN COALESCE(m.content_kind, 'movie') = 'serial'
-                     AND COALESCE(m.episode_number, 0) > 0
-                THEN COALESCE(NULLIF(m.series_title, ''), m.title) || ' ' || m.episode_number || '-qism'
-                ELSE COALESCE(m.title, 'Noma''lum kino')
-            END,
-            mv.views,
-            {unique_views_expr} AS unique_views
+            COALESCE(sg.code, mv.code) AS code,
+            {group_title_expr} AS display_title,
+            SUM(COALESCE(mv.views, 0)) AS views,
+            {unique_expr} AS unique_views
         FROM movie_views mv
         LEFT JOIN movies m ON m.code = mv.code
+        LEFT JOIN serial_groups sg
+          ON COALESCE(m.content_kind, 'movie') = 'serial'
+         AND sg.title = COALESCE(NULLIF(m.series_title, ''), m.title)
+        {unique_join}
+        GROUP BY
+            CASE WHEN COALESCE(m.content_kind, 'movie') = 'serial' THEN 'serial' ELSE 'movie' END,
+            COALESCE(sg.code, mv.code),
+            {group_title_expr}
         ORDER BY
-            mv.views DESC,
+            views DESC,
             unique_views DESC,
-            COALESCE(mv.last_viewed_at, '') DESC,
-            mv.code ASC
+            code ASC
         LIMIT ?
     """
         return [
             (
                 row["code"],
-                row[1],
+                row["display_title"],
                 int(row["views"] or 0),
                 int(row["unique_views"] or 0),
             )
@@ -509,20 +555,26 @@ def _query_recent_users(limit: int = 5) -> list[tuple[str, str, str]]:
 
 
 def _render_chart(
-    values: list[int], labels: list[str], color_var: str = "var(--primary)"
+    values: list[int],
+    labels: list[str],
+    color_var: str = "var(--primary)",
+    hrefs: list[str] | None = None,
 ) -> str:
     maximum = max(values) if values else 0
     maximum = max(maximum, 1)
     html = ""
-    for val, lab in zip(values, labels):
+    for index, (val, lab) in enumerate(zip(values, labels)):
         h = int((val / maximum) * 100)
         visible_height = max(h, 8) if val > 0 else 0
+        tag = "a" if hrefs and index < len(hrefs) and hrefs[index] else "div"
+        href_attr = f' href="{escape(hrefs[index], quote=True)}"' if tag == "a" else ""
+        link_style = ' style="text-decoration:none;color:inherit;"' if tag == "a" else ""
         html += f"""
-        <div class="chart-col" title="{val}">
+        <{tag} class="chart-col" title="{val}"{href_attr}{link_style}>
             <div class="chart-value">{_format_number(val)}</div>
             <div class="bar-wrap"><div class="bar" style="background: {color_var}; height: {visible_height}%"></div></div>
-            <div class="chart-label">{lab[5:]}</div>
-        </div>
+            <div class="chart-label">{escape(lab[5:] if len(lab) > 5 else lab)}</div>
+        </{tag}>
         """
     return html
 
@@ -1101,6 +1153,10 @@ def _build_url(path: str, pairs: list[tuple[str, str]]) -> str:
     return f"{path}?{urlencode(cleaned_pairs)}"
 
 
+def _build_action_url(action_key: str, auth_query: list[tuple[str, str]]) -> str:
+    return _build_url(f"{ACTION_ROUTE_PREFIX}{action_key}", auth_query)
+
+
 def _dashboard_href(auth_query: list[tuple[str, str]]) -> str:
     return _build_url("/", auth_query)
 
@@ -1112,11 +1168,20 @@ def _build_detail_href(
     page: int | None = None,
     q: str | None = None,
     status: str | None = None,
+    day: str | None = None,
+    code: str | None = None,
+    user_id: int | str | None = None,
 ) -> str:
     pairs = list(auth_query)
     normalized_q = _normalize_search_text(q or "")
     if status and status in REQUEST_STATUS_FILTERS and status != "all":
         pairs.append(("status", status))
+    if day:
+        pairs.append(("day", day))
+    if code:
+        pairs.append(("code", code))
+    if user_id:
+        pairs.append(("user_id", str(user_id)))
     if normalized_q:
         pairs.append(("q", normalized_q))
     if page and page > 1:
@@ -1575,30 +1640,35 @@ def _query_top_movies_detail_page(
 
     with sqlite3.connect(DB_PATH, timeout=5, check_same_thread=False) as conn:
         conn.row_factory = sqlite3.Row
-        movie_view_columns = {
-            str(row[1]) for row in conn.execute("PRAGMA table_info(movie_views)").fetchall()
-        }
-        unique_views_expr = (
-            "COALESCE(mv.unique_views, mv.views)"
-            if "unique_views" in movie_view_columns
-            else "mv.views"
+        if _table_exists(conn, "movie_unique_views"):
+            unique_expr = "COUNT(DISTINCT muv.user_id)"
+            unique_join = "LEFT JOIN movie_unique_views muv ON muv.code = mv.code"
+        else:
+            unique_expr = "SUM(COALESCE(mv.unique_views, mv.views))"
+            unique_join = ""
+        title_expr = _content_group_title_expr("m")
+        group_select = (
+            "CASE WHEN COALESCE(m.content_kind, 'movie') = 'serial' "
+            "THEN COALESCE(sg.code, COALESCE(NULLIF(m.series_title, ''), m.title)) "
+            "ELSE mv.code END"
         )
-        title_expr = (
-            "CASE "
-            "WHEN COALESCE(m.content_kind, 'movie') = 'serial' "
-            "AND COALESCE(m.episode_number, 0) > 0 "
-            "THEN COALESCE(NULLIF(m.series_title, ''), m.title) || ' ' || m.episode_number || '-qism' "
-            "ELSE COALESCE(m.title, 'Noma''lum kino') "
-            "END"
+        kind_expr = (
+            "CASE WHEN COALESCE(m.content_kind, 'movie') = 'serial' THEN 'serial' ELSE 'movie' END"
         )
         search_clause, search_params = _movie_search_clause(search_text, title_expr)
 
         total_row = conn.execute(
             f"""
-            SELECT COUNT(*) AS total_count
-            FROM movie_views mv
-            LEFT JOIN movies m ON m.code = mv.code
-            WHERE 1 = 1 {search_clause}
+            SELECT COUNT(*) AS total_count FROM (
+                SELECT {kind_expr} AS item_kind, {group_select} AS item_code
+                FROM movie_views mv
+                LEFT JOIN movies m ON m.code = mv.code
+                LEFT JOIN serial_groups sg
+                  ON COALESCE(m.content_kind, 'movie') = 'serial'
+                 AND sg.title = COALESCE(NULLIF(m.series_title, ''), m.title)
+                WHERE 1 = 1 {search_clause}
+                GROUP BY item_kind, item_code, {title_expr}
+            )
             """,
             tuple(search_params),
         ).fetchone()
@@ -1608,25 +1678,356 @@ def _query_top_movies_detail_page(
         rows = conn.execute(
             f"""
             SELECT
-                mv.code,
+                {group_select} AS item_code,
+                {kind_expr} AS item_kind,
                 {title_expr} AS display_title,
-                COALESCE(mv.views, 0) AS views,
-                {unique_views_expr} AS unique_views,
-                COALESCE(mv.last_viewed_at, '') AS last_viewed_at
+                SUM(COALESCE(mv.views, 0)) AS views,
+                {unique_expr} AS unique_views,
+                MAX(COALESCE(mv.last_viewed_at, '')) AS last_viewed_at
             FROM movie_views mv
             LEFT JOIN movies m ON m.code = mv.code
+            LEFT JOIN serial_groups sg
+              ON COALESCE(m.content_kind, 'movie') = 'serial'
+             AND sg.title = COALESCE(NULLIF(m.series_title, ''), m.title)
+            {unique_join}
             WHERE 1 = 1 {search_clause}
+            GROUP BY item_kind, item_code, display_title
             ORDER BY
                 views DESC,
                 unique_views DESC,
                 last_viewed_at DESC,
-                mv.code ASC
+                item_code ASC
             LIMIT ? OFFSET ?
             """,
             tuple(search_params + [DETAIL_PAGE_SIZE, page_meta["offset"]]),
         ).fetchall()
 
     return {
+        "total_count": total_count,
+        "page": page_meta["page"],
+        "page_size": DETAIL_PAGE_SIZE,
+        "total_pages": page_meta["total_pages"],
+        "rows": rows,
+    }
+
+
+def _query_serial_episodes_detail_page(
+    *,
+    group_code: str,
+    page: int,
+) -> dict[str, object] | None:
+    if not DB_PATH.exists() or not group_code:
+        return None
+
+    with sqlite3.connect(DB_PATH, timeout=5, check_same_thread=False) as conn:
+        conn.row_factory = sqlite3.Row
+        group = conn.execute(
+            "SELECT code, title, COALESCE(description, '') AS description FROM serial_groups WHERE code=?",
+            (group_code,),
+        ).fetchone()
+        if group is None:
+            return None
+
+        if _table_exists(conn, "movie_unique_views"):
+            unique_expr = "COUNT(DISTINCT muv.user_id)"
+            unique_join = "LEFT JOIN movie_unique_views muv ON muv.code = mv.code"
+        else:
+            unique_expr = "COALESCE(mv.unique_views, mv.views)"
+            unique_join = ""
+
+        total_row = conn.execute(
+            """
+            SELECT COUNT(*) AS total_count
+            FROM movies
+            WHERE COALESCE(content_kind, 'movie') = 'serial'
+              AND COALESCE(NULLIF(series_title, ''), title) = ?
+            """,
+            (str(group["title"]),),
+        ).fetchone()
+        total_count = int(total_row["total_count"] or 0) if total_row else 0
+        page_meta = _pagination_meta(total_count, page)
+
+        rows = conn.execute(
+            f"""
+            SELECT
+                m.code,
+                COALESCE(m.episode_number, 0) AS episode_number,
+                {_content_display_title_expr("m")} AS display_title,
+                COALESCE(mv.views, 0) AS views,
+                {unique_expr} AS unique_views,
+                COALESCE(mv.last_viewed_at, '') AS last_viewed_at
+            FROM movies m
+            LEFT JOIN movie_views mv ON mv.code = m.code
+            {unique_join}
+            WHERE COALESCE(m.content_kind, 'movie') = 'serial'
+              AND COALESCE(NULLIF(m.series_title, ''), m.title) = ?
+            GROUP BY m.code, episode_number, display_title, mv.views, mv.unique_views, mv.last_viewed_at
+            ORDER BY
+                CASE WHEN episode_number <= 0 THEN 1 ELSE 0 END,
+                episode_number ASC,
+                views DESC,
+                m.code ASC
+            LIMIT ? OFFSET ?
+            """,
+            (str(group["title"]), DETAIL_PAGE_SIZE, page_meta["offset"]),
+        ).fetchall()
+
+    return {
+        "group": group,
+        "total_count": total_count,
+        "page": page_meta["page"],
+        "page_size": DETAIL_PAGE_SIZE,
+        "total_pages": page_meta["total_pages"],
+        "rows": rows,
+    }
+
+
+def _day_bounds(day: str) -> tuple[str, str] | None:
+    try:
+        local_start = datetime.fromisoformat(day).replace(tzinfo=APP_TIMEZONE)
+    except ValueError:
+        return None
+    utc_start = local_start.astimezone(UTC).replace(tzinfo=None, microsecond=0)
+    utc_end = (local_start + timedelta(days=1)).astimezone(UTC).replace(
+        tzinfo=None,
+        microsecond=0,
+    )
+    return _db_timestamp(utc_start), _db_timestamp(utc_end)
+
+
+def _query_content_activity_day_page(
+    *,
+    day: str,
+    page: int,
+) -> dict[str, object]:
+    empty_page = {
+        "total_count": 0,
+        "page": 1,
+        "page_size": DETAIL_PAGE_SIZE,
+        "total_pages": 1,
+        "rows": [],
+        "day": day,
+        "has_events": False,
+    }
+    bounds = _day_bounds(day)
+    if not bounds or not DB_PATH.exists():
+        return empty_page
+
+    start_at, end_at = bounds
+    with sqlite3.connect(DB_PATH, timeout=5, check_same_thread=False) as conn:
+        conn.row_factory = sqlite3.Row
+        if not _table_exists(conn, "content_view_events"):
+            return empty_page
+
+        title_expr = _content_display_title_expr("m")
+        total_row = conn.execute(
+            """
+            SELECT COUNT(*) AS total_count FROM (
+                SELECT cve.code
+                FROM content_view_events cve
+                WHERE cve.viewed_at >= ? AND cve.viewed_at < ?
+                GROUP BY cve.code
+            )
+            """,
+            (start_at, end_at),
+        ).fetchone()
+        total_count = int(total_row["total_count"] or 0) if total_row else 0
+        page_meta = _pagination_meta(total_count, page)
+        rows = conn.execute(
+            f"""
+            SELECT
+                cve.code,
+                {title_expr} AS display_title,
+                COALESCE(m.content_kind, 'movie') AS content_kind,
+                COUNT(*) AS views,
+                COUNT(DISTINCT cve.user_id) AS unique_users,
+                MAX(cve.viewed_at) AS last_viewed_at
+            FROM content_view_events cve
+            LEFT JOIN movies m ON m.code = cve.code
+            WHERE cve.viewed_at >= ? AND cve.viewed_at < ?
+            GROUP BY cve.code, display_title, content_kind
+            ORDER BY views DESC, unique_users DESC, last_viewed_at DESC, cve.code ASC
+            LIMIT ? OFFSET ?
+            """,
+            (start_at, end_at, DETAIL_PAGE_SIZE, page_meta["offset"]),
+        ).fetchall()
+
+    return {
+        "total_count": total_count,
+        "page": page_meta["page"],
+        "page_size": DETAIL_PAGE_SIZE,
+        "total_pages": page_meta["total_pages"],
+        "rows": rows,
+        "day": day,
+        "has_events": True,
+    }
+
+
+def _query_user_today_activity_map(user_ids: list[int]) -> dict[int, str]:
+    if not user_ids or not DB_PATH.exists():
+        return {}
+
+    bounds = _day_bounds(local_day_keys(1)[0])
+    if not bounds:
+        return {}
+    start_at, end_at = bounds
+    placeholders = ", ".join("?" for _ in user_ids)
+    result: dict[int, str] = {user_id: "" for user_id in user_ids}
+    with sqlite3.connect(DB_PATH, timeout=5, check_same_thread=False) as conn:
+        conn.row_factory = sqlite3.Row
+        if _table_exists(conn, "user_search_events"):
+            rows = conn.execute(
+                f"""
+                SELECT user_id, raw_query, normalized_code, resolved_code, result_status, content_kind
+                FROM user_search_events
+                WHERE created_at >= ? AND created_at < ?
+                  AND user_id IN ({placeholders})
+                ORDER BY created_at DESC
+                """,
+                (start_at, end_at, *user_ids),
+            ).fetchall()
+            seen_counts: dict[int, int] = {}
+            snippets: dict[int, list[str]] = {}
+            for row in rows:
+                user_id = int(row["user_id"])
+                count = seen_counts.get(user_id, 0)
+                seen_counts[user_id] = count + 1
+                if count >= 3:
+                    continue
+                raw_query = str(row["raw_query"] or row["normalized_code"] or "-")
+                resolved = str(row["resolved_code"] or "")
+                status = str(row["result_status"] or "")
+                label = raw_query
+                if resolved:
+                    label = f"{raw_query} -> {resolved}"
+                if status and status != "movie":
+                    label = f"{label} ({status})"
+                snippets.setdefault(user_id, []).append(escape(label))
+            for user_id, values in snippets.items():
+                extra = seen_counts.get(user_id, 0) - len(values)
+                result[user_id] = "; ".join(values) + (f"; +{extra}" if extra > 0 else "")
+
+        if _table_exists(conn, "content_view_events"):
+            rows = conn.execute(
+                f"""
+                SELECT cve.user_id, cve.code, {_content_display_title_expr("m")} AS display_title, COUNT(*) AS views
+                FROM content_view_events cve
+                LEFT JOIN movies m ON m.code = cve.code
+                WHERE cve.viewed_at >= ? AND cve.viewed_at < ?
+                  AND cve.user_id IN ({placeholders})
+                GROUP BY cve.user_id, cve.code, display_title
+                ORDER BY cve.user_id ASC, views DESC
+                """,
+                (start_at, end_at, *user_ids),
+            ).fetchall()
+            opened: dict[int, list[str]] = {}
+            for row in rows:
+                user_id = int(row["user_id"])
+                if len(opened.setdefault(user_id, [])) >= 3:
+                    continue
+                opened[user_id].append(escape(str(row["display_title"] or row["code"] or "-")))
+            for user_id, values in opened.items():
+                prefix = result.get(user_id, "")
+                opened_text = "Ochgan: " + "; ".join(values)
+                result[user_id] = f"{prefix}<br>{opened_text}" if prefix else opened_text
+
+    return {user_id: value for user_id, value in result.items() if value}
+
+
+def _query_user_activity_detail_page(
+    *,
+    user_id: int,
+    page: int,
+) -> dict[str, object] | None:
+    if user_id <= 0 or not DB_PATH.exists():
+        return None
+
+    with sqlite3.connect(DB_PATH, timeout=5, check_same_thread=False) as conn:
+        conn.row_factory = sqlite3.Row
+        user = conn.execute(
+            "SELECT user_id, username, full_name, COALESCE(first_seen, '') AS first_seen FROM users WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+        if user is None:
+            return None
+        first_seen = str(user["first_seen"] or "").strip()
+
+        search_exists = _table_exists(conn, "user_search_events")
+        view_exists = _table_exists(conn, "content_view_events")
+        if not search_exists and not view_exists:
+            return {
+                "user": user,
+                "total_count": 0,
+                "page": 1,
+                "page_size": DETAIL_PAGE_SIZE,
+                "total_pages": 1,
+                "rows": [],
+            }
+
+        union_parts = []
+        params: list[object] = []
+        if search_exists:
+            first_seen_filter = " AND created_at >= ?" if first_seen else ""
+            union_parts.append(
+                f"""
+                SELECT
+                    created_at AS event_at,
+                    'search' AS event_type,
+                    raw_query,
+                    normalized_code,
+                    resolved_code,
+                    result_status,
+                    content_kind,
+                    NULL AS title
+                FROM user_search_events
+                WHERE user_id=?
+                {first_seen_filter}
+                """
+            )
+            params.append(user_id)
+            if first_seen:
+                params.append(first_seen)
+        if view_exists:
+            first_seen_filter = " AND cve.viewed_at >= ?" if first_seen else ""
+            union_parts.append(
+                f"""
+                SELECT
+                    cve.viewed_at AS event_at,
+                    'view' AS event_type,
+                    NULL AS raw_query,
+                    cve.code AS normalized_code,
+                    cve.code AS resolved_code,
+                    'opened' AS result_status,
+                    COALESCE(m.content_kind, 'movie') AS content_kind,
+                    {_content_display_title_expr("m")} AS title
+                FROM content_view_events cve
+                LEFT JOIN movies m ON m.code = cve.code
+                WHERE cve.user_id=?
+                {first_seen_filter}
+                """
+            )
+            params.append(user_id)
+            if first_seen:
+                params.append(first_seen)
+
+        union_sql = " UNION ALL ".join(union_parts)
+        total_row = conn.execute(
+            f"SELECT COUNT(*) AS total_count FROM ({union_sql})",
+            tuple(params),
+        ).fetchone()
+        total_count = int(total_row["total_count"] or 0) if total_row else 0
+        page_meta = _pagination_meta(total_count, page)
+        rows = conn.execute(
+            f"""
+            SELECT * FROM ({union_sql})
+            ORDER BY event_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [DETAIL_PAGE_SIZE, page_meta["offset"]]),
+        ).fetchall()
+
+    return {
+        "user": user,
         "total_count": total_count,
         "page": page_meta["page"],
         "page_size": DETAIL_PAGE_SIZE,
@@ -1963,27 +2364,47 @@ def _build_user_detail_page(
         stats.append(("7 kun faol", _format_number(summary["active_week"])))
 
     rows_html = []
+    row_user_ids = [int(row["user_id"]) for row in page_data["rows"]]
+    today_activity = _query_user_today_activity_map(row_user_ids)
     for row in page_data["rows"]:
         username = str(row["username"] or "").strip()
         full_name = str(row["full_name"] or "").strip() or f"User {row['user_id']}"
+        user_id = int(row["user_id"])
         status_badge = (
             '<span class="badge badge-accent">Bloklangan</span>'
             if int(row["is_blocked"] or 0)
             else '<span class="badge badge-success">Faol</span>'
         )
+        activity_href = _build_detail_href("user-activity", auth_query, user_id=user_id)
+        activity_text = today_activity.get(user_id) or (
+            '<span class="muted">Bugun qidiruv/ochish yo&apos;q</span>'
+        )
         rows_html.append(
             "<tr>"
-            f"<td>{int(row['user_id'])}</td>"
+            f"<td>{user_id}</td>"
             f"<td>{escape(full_name)}</td>"
             f"<td>{escape(f'@{username}' if username else '-')}</td>"
             f"<td>{escape(_format_detail_timestamp(row['first_seen']))}</td>"
             f"<td>{escape(_format_detail_timestamp(row['last_seen']))}</td>"
             f"<td>{status_badge}</td>"
             f"<td>{escape(_format_detail_timestamp(row['blocked_at']))}</td>"
+            f"<td>{activity_text}<br><a class=\"inline-link\" href=\"{escape(activity_href, quote=True)}\">Batafsil</a></td>"
             "</tr>"
         )
 
     body_html = _render_stats_strip(stats)
+    if metric_key == "blocked-users" and int(page_data["total_count"]) > 0:
+        action_url = _build_action_url("delete-blocked-users", auth_query)
+        body_html += (
+            '<form class="card note-card" method="post" '
+            f'action="{escape(action_url, quote=True)}" '
+            'onsubmit="return confirm(\'Bloklagan userlar users jadvalidan o\\\'chirilsinmi?\');">'
+            '<p>Bu amal bloklagan foydalanuvchilarni faqat users ro&apos;yxatidan o&apos;chiradi. '
+            'Tarixiy ko&apos;rish statistikasi saqlanadi.</p>'
+            '<button class="button" type="submit" style="margin-top:12px;background:var(--accent);color:white;">'
+            'Bloklaganlarni udalit qilish</button>'
+            '</form>'
+        )
     body_html += _render_search_form(
         action_path=f"{DETAIL_ROUTE_PREFIX}{metric_key}",
         auth_query=auth_query,
@@ -1994,10 +2415,10 @@ def _build_user_detail_page(
     if config.get("note"):
         body_html += f'<div class="card note-card"><p>{escape(str(config["note"]))}</p></div>'
     body_html += _render_table_card(
-        ["User ID", "Ism", "Username", "Birinchi kirgan", "Oxirgi faollik", "Holat", "Blok vaqti"],
+        ["User ID", "Ism", "Username", "Birinchi kirgan", "Oxirgi faollik", "Holat", "Blok vaqti", "Bugungi qidiruv / ochgan"],
         rows_html,
         empty_message="Bu filtr bo'yicha foydalanuvchi topilmadi.",
-        min_width=920,
+        min_width=1180,
     )
     body_html += _render_pagination(
         metric_key,
@@ -2132,11 +2553,22 @@ def _build_top_movies_detail_page(
     rank_offset = (int(page_data["page"]) - 1) * DETAIL_PAGE_SIZE
     for index, row in enumerate(page_data["rows"], start=1):
         display_title = str(row["display_title"] or "Noma'lum kino")
+        item_kind = str(row["item_kind"] or "movie")
+        code_text = str(row["item_code"] or "-")
+        if item_kind == "serial":
+            title_html = (
+                f'<a class="inline-link" href="{escape(_build_detail_href("serial-episodes", auth_query, code=code_text), quote=True)}">'
+                f"{escape(display_title)}</a>"
+            )
+            kind_badge = '<span class="badge badge-neutral">Serial fasli</span>'
+        else:
+            title_html = escape(display_title)
+            kind_badge = '<span class="badge badge-success">Kino</span>'
         rows_html.append(
             "<tr>"
             f"<td>{rank_offset + index}</td>"
-            f"<td>{escape(str(row['code'] or '-'))}</td>"
-            f"<td>{escape(display_title)}</td>"
+            f"<td>{escape(code_text)}</td>"
+            f"<td>{title_html}<br>{kind_badge}</td>"
             f"<td>{_format_number(int(row['views'] or 0))}</td>"
             f"<td>{_format_number(int(row['unique_views'] or 0))}</td>"
             f"<td>{escape(_format_detail_timestamp(row['last_viewed_at']))}</td>"
@@ -2172,6 +2604,185 @@ def _build_top_movies_detail_page(
     )
 
 
+def _build_serial_episodes_detail_page(
+    auth_query: list[tuple[str, str]],
+    query: dict[str, list[str]],
+) -> str | None:
+    group_code = _query_value(query, "code")
+    requested_page = _parse_page_number(_query_value(query, "page"))
+    page_data = _query_serial_episodes_detail_page(group_code=group_code, page=requested_page)
+    if page_data is None:
+        return None
+
+    group = page_data["group"]
+    rows_html = []
+    for row in page_data["rows"]:
+        episode_number = int(row["episode_number"] or 0)
+        label = f"{episode_number}-qism" if episode_number > 0 else str(row["display_title"] or "-")
+        rows_html.append(
+            "<tr>"
+            f"<td>{escape(str(row['code'] or '-'))}</td>"
+            f"<td>{escape(label)}</td>"
+            f"<td>{escape(str(row['display_title'] or '-'))}</td>"
+            f"<td>{_format_number(int(row['views'] or 0))}</td>"
+            f"<td>{_format_number(int(row['unique_views'] or 0))}</td>"
+            f"<td>{escape(_format_detail_timestamp(row['last_viewed_at']))}</td>"
+            "</tr>"
+        )
+
+    body_html = _render_stats_strip(
+        [
+            ("Qismlar", _format_number(int(page_data["total_count"]))),
+            ("Sahifa", f"{page_data['page']} / {page_data['total_pages']}"),
+        ]
+    )
+    body_html += _render_table_card(
+        ["Kod", "Qism", "Nomi", "Ko'rishlar", "Unique user", "Oxirgi ko'rilgan"],
+        rows_html,
+        empty_message="Bu serial uchun qism statistikasi topilmadi.",
+        min_width=860,
+    )
+    body_html += _render_pagination(
+        "serial-episodes",
+        auth_query,
+        page=int(page_data["page"]),
+        total_pages=int(page_data["total_pages"]),
+        q="",
+    ).replace("serial-episodes?", f"serial-episodes?code={quote(group_code, safe='')}&", 1)
+    return _build_detail_shell(
+        title=f"{group['title']} qismlari",
+        description="Serial fasli ichidagi qismlar ko'rishlar bo'yicha tartibli ro'yxat.",
+        body_html=body_html,
+        auth_query=auth_query,
+    )
+
+
+def _build_content_activity_day_page(
+    auth_query: list[tuple[str, str]],
+    query: dict[str, list[str]],
+) -> str:
+    day = _query_value(query, "day") or local_day_keys(1)[0]
+    requested_page = _parse_page_number(_query_value(query, "page"))
+    page_data = _query_content_activity_day_page(day=day, page=requested_page)
+
+    rows_html = []
+    for row in page_data["rows"]:
+        kind = str(row["content_kind"] or "movie")
+        badge = '<span class="badge badge-neutral">Serial</span>' if kind == "serial" else '<span class="badge badge-success">Kino</span>'
+        rows_html.append(
+            "<tr>"
+            f"<td>{escape(str(row['code'] or '-'))}</td>"
+            f"<td>{escape(str(row['display_title'] or '-'))}<br>{badge}</td>"
+            f"<td>{_format_number(int(row['views'] or 0))}</td>"
+            f"<td>{_format_number(int(row['unique_users'] or 0))}</td>"
+            f"<td>{escape(_format_detail_timestamp(row['last_viewed_at']))}</td>"
+            "</tr>"
+        )
+
+    note = ""
+    if not page_data.get("has_events"):
+        note = (
+            '<div class="card note-card"><p>Kun-kod kesimidagi detail statistika yangi tracking yoqilgandan keyin yig&apos;iladi. '
+            'Eski kunlar uchun faqat umumiy daily_stats sonlari mavjud.</p></div>'
+        )
+    body_html = _render_stats_strip(
+        [
+            ("Sana", _format_date(day)),
+            ("Kontentlar", _format_number(int(page_data["total_count"]))),
+            ("Sahifa", f"{page_data['page']} / {page_data['total_pages']}"),
+        ]
+    )
+    body_html += note
+    body_html += _render_table_card(
+        ["Kod", "Kontent", "Ko'rishlar", "Unique user", "Oxirgi ko'rilgan"],
+        rows_html,
+        empty_message="Bu kun uchun kontent detail topilmadi.",
+        min_width=820,
+    )
+    body_html += _render_pagination(
+        "content-activity-day",
+        auth_query,
+        page=int(page_data["page"]),
+        total_pages=int(page_data["total_pages"]),
+        q="",
+    ).replace("content-activity-day?", f"content-activity-day?day={quote(day, safe='')}&", 1)
+    return _build_detail_shell(
+        title=f"Kontent faolligi: {_format_date(day)}",
+        description="Tanlangan kunda ko'rilgan kinolar va serial qismlari.",
+        body_html=body_html,
+        auth_query=auth_query,
+    )
+
+
+def _build_user_activity_detail_page(
+    auth_query: list[tuple[str, str]],
+    query: dict[str, list[str]],
+) -> str | None:
+    try:
+        user_id = int(_query_value(query, "user_id"))
+    except ValueError:
+        return None
+
+    requested_page = _parse_page_number(_query_value(query, "page"))
+    page_data = _query_user_activity_detail_page(user_id=user_id, page=requested_page)
+    if page_data is None:
+        return None
+
+    user = page_data["user"]
+    rows_html = []
+    for row in page_data["rows"]:
+        event_type = str(row["event_type"] or "")
+        if event_type == "view":
+            detail = str(row["title"] or row["resolved_code"] or "-")
+            badge = '<span class="badge badge-success">Ochdi</span>'
+        else:
+            raw_query = str(row["raw_query"] or row["normalized_code"] or "-")
+            resolved = str(row["resolved_code"] or "")
+            status = str(row["result_status"] or "")
+            detail = f"{raw_query} -> {resolved}" if resolved else raw_query
+            badge = f'<span class="badge badge-neutral">{escape(status or "search")}</span>'
+            if status in {"not_found", "error"}:
+                badge = f'<span class="badge badge-accent">{escape(status)}</span>'
+        rows_html.append(
+            "<tr>"
+            f"<td>{escape(_format_detail_timestamp(row['event_at']))}</td>"
+            f"<td>{badge}</td>"
+            f"<td>{escape(detail)}</td>"
+            f"<td>{escape(str(row['content_kind'] or '-'))}</td>"
+            "</tr>"
+        )
+
+    username = str(user["username"] or "").strip()
+    full_name = str(user["full_name"] or "").strip() or f"User {user_id}"
+    body_html = _render_stats_strip(
+        [
+            ("User ID", str(user_id)),
+            ("Eventlar", _format_number(int(page_data["total_count"]))),
+            ("Birinchi kirgan", _format_detail_timestamp(user["first_seen"])),
+            ("Sahifa", f"{page_data['page']} / {page_data['total_pages']}"),
+        ]
+    )
+    body_html += _render_table_card(
+        ["Vaqt", "Tur", "Qidiruv / kontent", "Kontent turi"],
+        rows_html,
+        empty_message="Bu user uchun activity log topilmadi.",
+        min_width=760,
+    )
+    body_html += _render_pagination(
+        "user-activity",
+        auth_query,
+        page=int(page_data["page"]),
+        total_pages=int(page_data["total_pages"]),
+        q="",
+    ).replace("user-activity?", f"user-activity?user_id={user_id}&", 1)
+    return _build_detail_shell(
+        title=f"{full_name} activity",
+        description=f"{'@' + username if username else 'Username yoq'} | botga kirgandan hozirgacha qidiruv urinishlari va ochilgan kontentlar.",
+        body_html=body_html,
+        auth_query=auth_query,
+    )
+
+
 def _build_aggregate_detail_page(
     *,
     title: str,
@@ -2183,6 +2794,7 @@ def _build_aggregate_detail_page(
     note: str,
     auth_query: list[tuple[str, str]],
     footer_html: str = "",
+    chart_hrefs: list[str] | None = None,
 ) -> str:
     rows_html = [
         "<tr>"
@@ -2195,7 +2807,7 @@ def _build_aggregate_detail_page(
     body_html += f'<div class="card note-card"><p>{escape(note)}</p></div>'
     body_html += (
         '<div class="card">'
-        f'<div class="chart">{_render_chart(values, labels, color_var)}</div>'
+        f'<div class="chart">{_render_chart(values, labels, color_var, hrefs=chart_hrefs)}</div>'
         "</div>"
     )
     body_html += _render_table_card(
@@ -2290,6 +2902,15 @@ def _build_detail_page(metric_key: str, query: dict[str, list[str]]) -> str | No
     if metric_key == "top-movies":
         return _build_top_movies_detail_page(auth_query, query)
 
+    if metric_key == "serial-episodes":
+        return _build_serial_episodes_detail_page(auth_query, query)
+
+    if metric_key == "content-activity-day":
+        return _build_content_activity_day_page(auth_query, query)
+
+    if metric_key == "user-activity":
+        return _build_user_activity_detail_page(auth_query, query)
+
     if metric_key == "requests-7d":
         daily = _query_daily_series(7)
         summary = _query_summary()
@@ -2319,6 +2940,10 @@ def _build_detail_page(metric_key: str, query: dict[str, list[str]]) -> str | No
         daily = _query_daily_series(7)
         summary = _query_summary()
         values = daily["movie_views"]
+        day_hrefs = [
+            _build_detail_href("content-activity-day", auth_query, day=label)
+            for label in daily["labels"]
+        ]
         footer_html = (
             '<div class="card note-card" style="margin-top:18px;">'
             f'<a class="inline-link" href="{escape(_build_detail_href("top-movies", auth_query), quote=True)}">Top kinolar detail sahifasiga o&apos;tish</a>'
@@ -2330,6 +2955,7 @@ def _build_detail_page(metric_key: str, query: dict[str, list[str]]) -> str | No
             values=values,
             labels=daily["labels"],
             color_var="var(--secondary)",
+            chart_hrefs=day_hrefs,
             stats=[
                 ("7 kun jami", _format_number(sum(values))),
                 ("Bugun", _format_number(values[-1] if values else 0)),
@@ -2592,6 +3218,31 @@ class SimpleHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+        if parsed.path.startswith(ACTION_ROUTE_PREFIX):
+            if not _stats_request_is_authorized(self, query):
+                _send_bytes(
+                    self,
+                    403,
+                    _unauthorized_stats_page(),
+                    content_type="text/html; charset=utf-8",
+                )
+                return
+
+            action_key = unquote(parsed.path[len(ACTION_ROUTE_PREFIX) :]).strip().strip("/")
+            auth_query = _auth_query_pairs(query)
+            if action_key == "delete-blocked-users":
+                if DB_PATH.exists():
+                    with sqlite3.connect(DB_PATH, timeout=5, check_same_thread=False) as conn:
+                        conn.execute("DELETE FROM users WHERE COALESCE(is_blocked, 0) = 1")
+                        conn.commit()
+                _cache["payload"] = None
+                _redirect(self, _build_detail_href("blocked-users", auth_query))
+                return
+
+            self.send_error(404, "Not Found")
+            return
+
         if parsed.path != "/auth-bootstrap":
             self.send_error(404, "Not Found")
             return
