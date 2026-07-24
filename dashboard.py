@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
@@ -32,16 +35,45 @@ PANEL_TITLES = {
     "requests": "So'rovlar Holati",
 }
 
-FONT_DIR = Path("C:/Windows/Fonts")
-FONT_REGULAR = [
-    FONT_DIR / "segoeui.ttf",
-    FONT_DIR / "arial.ttf",
-]
-FONT_BOLD = [
-    FONT_DIR / "seguisb.ttf",
-    FONT_DIR / "segoeuib.ttf",
-    FONT_DIR / "arialbd.ttf",
-]
+def _discover_fonts() -> tuple[list[Path], list[Path]]:
+    """OS ga qarab font yo'llarini aniqlash."""
+    import platform
+
+    system = platform.system()
+    local_fonts = Path(__file__).resolve().parent / "fonts"
+
+    regular: list[Path] = []
+    bold: list[Path] = []
+
+    # Loyiha ichidagi fontlar (eng ishonchli)
+    if local_fonts.is_dir():
+        regular.extend(sorted(local_fonts.glob("*Regular*.ttf")))
+        bold.extend(sorted(local_fonts.glob("*Bold*.ttf")))
+
+    if system == "Windows":
+        win = Path("C:/Windows/Fonts")
+        regular += [win / "segoeui.ttf", win / "arial.ttf"]
+        bold += [win / "seguisb.ttf", win / "segoeuib.ttf", win / "arialbd.ttf"]
+    elif system == "Darwin":
+        mac = Path("/System/Library/Fonts")
+        regular += [mac / "Helvetica.ttc"]
+        bold += [mac / "Helvetica-Bold.ttf"]
+    else:  # Linux
+        regular += [
+            Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+            Path("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"),
+            Path("/usr/share/fonts/TTF/DejaVuSans.ttf"),
+        ]
+        bold += [
+            Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+            Path("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"),
+            Path("/usr/share/fonts/TTF/DejaVuSans-Bold.ttf"),
+        ]
+
+    return regular, bold
+
+
+FONT_REGULAR, FONT_BOLD = _discover_fonts()
 SPARKLINE_BARS = "▁▂▃▄▅▆▇█"
 
 

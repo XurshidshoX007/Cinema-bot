@@ -1,7 +1,10 @@
+import logging
 import os
 import json
 from contextlib import suppress
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 from urllib.parse import urlsplit
 
 try:

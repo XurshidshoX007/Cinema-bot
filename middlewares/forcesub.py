@@ -10,8 +10,8 @@ from aiogram.types import (
     Message,
 )
 
-from repositories.channels import get_sponsor_channels
-from repositories.users import (
+from database import get_sponsor_channels
+from database import (
     has_feature_trial_used,
     is_admin_user,
     mark_feature_trial_used,
@@ -245,6 +245,14 @@ async def ensure_feature_callback_access(
 
 
 class ForceSubMiddleware(BaseMiddleware):
+    """Force subscription tekshiruvi.
+
+    Hozirda asosiy tekshiruv ``ensure_feature_access`` /
+    ``ensure_feature_callback_access`` funksiyalari orqali amalga
+    oshiriladi.  Middleware sifatida global tekshiruv kerak bo'lsa,
+    shu yerga logika qo'shing.
+    """
+
     async def __call__(
         self,
         handler: Callable[[Message, Dict[str, Any]], Awaitable[Any]],
@@ -256,6 +264,9 @@ class ForceSubMiddleware(BaseMiddleware):
 
 @router.callback_query(F.data == "check_subscription")
 async def check_sub_handler(callback: CallbackQuery, bot: Bot) -> None:
+    if callback.from_user is None:
+        await callback.answer()
+        return
     user_id = callback.from_user.id
     unsubscribed, unknown = await get_channel_access_report(bot, user_id)
 

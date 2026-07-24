@@ -1,7 +1,12 @@
+import logging
+
 from aiogram import F, Router, types
+from aiogram.exceptions import TelegramBadRequest
+
+logger = logging.getLogger(__name__)
 
 from keyboards import movie_buttons, serial_hub_keyboard
-from repositories.content import (
+from database import (
     add_favorite,
     get_serial_episodes,
     get_serial_group_for_lookup,
@@ -17,6 +22,9 @@ router = Router()
 @router.callback_query(F.data.startswith(("fav_", "unfav_")))
 async def toggle_favorite(callback: types.CallbackQuery) -> None:
     await touch_callback_user(callback)
+    if callback.from_user is None:
+        await callback.answer()
+        return
     raw_code = callback.data.split("_")[1]
     serial_group = await get_serial_group_for_lookup(raw_code)
     code = serial_group[0] if serial_group is not None else raw_code
@@ -30,7 +38,7 @@ async def toggle_favorite(callback: types.CallbackQuery) -> None:
             await callback.message.edit_reply_markup(
                 reply_markup=movie_buttons(code, is_fav=False)
             )
-        except Exception:
+        except TelegramBadRequest:
             pass
     else:
         await add_favorite(user_id, code)
@@ -40,13 +48,16 @@ async def toggle_favorite(callback: types.CallbackQuery) -> None:
             await callback.message.edit_reply_markup(
                 reply_markup=movie_buttons(code, is_fav=True)
             )
-        except Exception:
+        except TelegramBadRequest:
             pass
 
 
 @router.callback_query(F.data.startswith(("serial_fav:", "serial_unfav:")))
 async def toggle_serial_favorite(callback: types.CallbackQuery) -> None:
     await touch_callback_user(callback)
+    if callback.from_user is None:
+        await callback.answer()
+        return
     try:
         action, code, page_text = callback.data.split(":", 2)
         page_value = int(page_text or 0)
@@ -90,5 +101,5 @@ async def toggle_serial_favorite(callback: types.CallbackQuery) -> None:
                 is_fav=is_fav,
             )
         )
-    except Exception:
+    except TelegramBadRequest:
         pass

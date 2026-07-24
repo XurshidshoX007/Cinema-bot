@@ -1,6 +1,10 @@
+import logging
+
 from aiogram import F, Router, types
 
-from repositories.users import mark_user_blocked, touch_user
+from database import mark_user_blocked, touch_user
+
+logger = logging.getLogger(__name__)
 
 router = Router()
 

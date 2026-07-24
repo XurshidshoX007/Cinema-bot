@@ -1,4 +1,8 @@
-﻿from aiogram.types import (
+import logging
+
+logger = logging.getLogger(__name__)
+
+from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,

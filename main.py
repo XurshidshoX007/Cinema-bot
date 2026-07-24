@@ -13,6 +13,7 @@ from advertising import run_ad_maintenance, shutdown_ad_tasks
 from config import BOT_TOKEN
 from database import DB_PATH, close_db, get_all_movies, init_db
 from handlers import ROUTERS
+from middlewares.security import InputSanitizationMiddleware
 from middlewares.throttling import AntiSpamMiddleware
 
 LOG_FORMAT = "%(asctime)s | %(levelname)s | %(message)s"
@@ -114,6 +115,10 @@ def setup_logging() -> None:
 def create_dispatcher() -> Dispatcher:
     dispatcher = Dispatcher()
 
+    # Xavfsizlik: kiruvchi matnlarni sanitizatsiya qilish (birinchi bo'lib ishlaydi)
+    dispatcher.message.middleware(InputSanitizationMiddleware())
+
+    # Anti-spam: tezlikni cheklash
     dispatcher.message.middleware(AntiSpamMiddleware(rate_limit=0.5))
     dispatcher.callback_query.middleware(AntiSpamMiddleware(rate_limit=0.5))
 

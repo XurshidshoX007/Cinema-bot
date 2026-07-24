@@ -1,6 +1,9 @@
+import logging
 import re
 from datetime import UTC, datetime
 from html import escape
+
+logger = logging.getLogger(__name__)
 
 from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
@@ -22,7 +25,6 @@ from database import (
     create_ad_campaign,
     delete_movie,
     get_admin_permissions,
-    get_ad_campaign,
     get_ads_by_status,
     get_all_movies,
     get_dashboard_summary,
@@ -51,11 +53,7 @@ from database import (
     touch_user,
     upsert_helper_admin,
     update_request_status,
-    get_sponsor_channels,
-    add_sponsor_channel,
     format_local_timestamp,
-    remove_sponsor_channel,
-    is_favorite,
     local_now_text,
     update_movie_description,
     update_movie_file_id,
@@ -94,7 +92,6 @@ from keyboards import (
     movie_menu,
     request_review_keyboard,
     request_existing_match_keyboard,
-    serial_hub_keyboard,
     serial_continue_keyboard,
     serial_mode_keyboard,
     serial_season_choice_keyboard,
@@ -189,6 +186,8 @@ async def _ensure_message_access(
     permission: str | None = None,
     owner_only: bool = False,
 ) -> bool:
+    if message.from_user is None:
+        return False
     user_id = message.from_user.id
     if owner_only:
         return _is_owner(user_id)
@@ -203,6 +202,8 @@ async def _ensure_callback_access(
     permission: str | None = None,
     owner_only: bool = False,
 ) -> bool:
+    if callback.from_user is None:
+        return False
     user_id = callback.from_user.id
     if owner_only:
         return _is_owner(user_id)
@@ -338,13 +339,6 @@ def _serial_description_prompt_text(title: str, episode_number: int) -> str:
     return (
         f"📝 <b>{_safe_html(title)}</b>\n"
         f"\n<i>{episode_number}-qism uchun tavsif yuboring</i>"
-    )
-
-
-def _serial_video_prompt_text(title: str, episode_number: int) -> str:
-    return (
-        f"🎬 <b>{_safe_html(title)}</b>\n"
-        f"\n<i>{episode_number}-qism videosini yuboring</i>"
     )
 
 
@@ -1638,7 +1632,7 @@ async def _launch_ad_campaign(
 
 @router.message(Command("shutdown"))
 async def shutdown_bot(message: types.Message, dispatcher: Dispatcher) -> None:
-    if not _is_owner(message.from_user.id):
+    if message.from_user is None or not _is_owner(message.from_user.id):
         return
 
     stop_event = dispatcher.get("owner_stop_event")
@@ -2241,19 +2235,19 @@ async def migrate_all_media(message: types.Message) -> None:
     F.text.in_(ADMIN_ACTIONS),
 )
 async def admin_global_handler(message: types.Message, state: FSMContext) -> None:
-    if not await _is_admin(message.from_user.id):
+    user = message.from_user
+    if user is None:
         return
 
-    await touch_user(
-        message.from_user.id,
-        message.from_user.username,
-        message.from_user.full_name,
-    )
+    if not await _is_admin(user.id):
+        return
+
+    await touch_user(user.id, user.username, user.full_name)
 
     text = message.text
     await state.clear()
-    permissions = await _admin_permissions(message.from_user.id)
-    is_owner = _is_owner(message.from_user.id)
+    permissions = await _admin_permissions(user.id)
+    is_owner = _is_owner(user.id)
 
     if text == ADMIN_PANEL_BUTTON:
         await message.answer(
@@ -2331,7 +2325,7 @@ async def admin_global_handler(message: types.Message, state: FSMContext) -> Non
             "⬅️ <b>Asosiy Menyu</b>\n\n<i>Nimani tanlaysiz?</i>",
             parse_mode="HTML",
             reply_markup=main_menu(
-                message.from_user.id, show_admin_panel=bool(permissions)
+                user.id, show_admin_panel=bool(permissions)
             ),
         )
 
@@ -3719,7 +3713,11 @@ async def accept_request(callback: types.CallbackQuery, state: FSMContext) -> No
         await callback.answer("Xabar topilmadi", show_alert=True)
         return
 
-    rid = int(callback.data.split("_", 1)[1])
+    try:
+        rid = int(callback.data.split("_", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Noto'g'ri so'rov", show_alert=True)
+        return
     request = await get_request(rid)
     if not request:
         await callback.answer("Bu so'rov topilmadi", show_alert=True)
@@ -3917,7 +3915,11 @@ async def reject_request(callback: types.CallbackQuery) -> None:
         await callback.answer("Xabar topilmadi", show_alert=True)
         return
 
-    rid = int(callback.data.split("_", 1)[1])
+    try:
+        rid = int(callback.data.split("_", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Noto'g'ri so'rov", show_alert=True)
+        return
     request = await get_request(rid)
     if not request:
         await callback.answer("Bu so'rov topilmadi", show_alert=True)
@@ -3962,117 +3964,19 @@ async def send_request_review(
         await message.answer_photo(
             photo=file_id, caption=review_text, reply_markup=keyboard
         )
-    except Exception:
+    except TelegramBadRequest:
         await message.answer_video(
             video=file_id, caption=review_text, reply_markup=keyboard
         )
 
-
-# Balanced premium text overrides
-# ======================
-# 📢 MAJBURIY KANALLAR
-# ======================
-
-
-@router.message(F.text == CHANNELS_BUTTON)
-async def admin_channels_menu(message: types.Message, state: FSMContext) -> None:
-    if not await _ensure_message_access(message, permission="channels"):
-        return
-
-    await state.clear()
-    channels = await get_sponsor_channels()
-
-    text = "📢 <b>Majburiy Kanallar (Force Subscription)</b>\n\n"
-    if not channels:
-        text += "<i>Hozircha hech qanday homiy kanal kiritilmagan.</i>\n\n"
-    else:
-        for idx, ch in enumerate(channels, 1):
-            text += f"<b>{idx}.</b> {ch['name']} — (<pre>{ch['id']}</pre>)\n🔗 {ch['url']}\n\n"
-
-    text += "➕ <b>Yangi kanal qo'shish</b>\n\n<i>Ma'lumotlarni bitta xabarda quyidagi ketma-ketlikda yuboring:</i>\n\n"
-    text += "<pre>@KanalID https://t.me/Link Kanal Nomi</pre>\n\n"
-    text += "Masalan:\n<pre>@PrimeCinema https://t.me/PrimeCinema Zo'r Kinolar</pre>"
-
-    # Inline buttons for deletes
-    buttons = []
-    for ch in channels:
-        buttons.append(
-            [
-                types.InlineKeyboardButton(
-                    text=f"🗑 {ch['name']}", callback_data=f"del_channel:{ch['id']}"
-                )
-            ]
-        )
-
-    markup = types.InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
-
-    await message.answer(
-        text, reply_markup=markup, parse_mode="HTML", disable_web_page_preview=True
-    )
-    await state.set_state(AdminChannelState.waiting_for_channel)
-
-
-@router.message(AdminChannelState.waiting_for_channel)
-async def receive_new_channel(message: types.Message, state: FSMContext) -> None:
-    if not await _ensure_message_access(message, permission="channels"):
-        return
-
-    if message.text in ADMIN_ACTIONS + USER_ACTIONS:
-        await state.clear()
-        return  # user pressed another menu button
-
-    parts = message.text.split(maxsplit=2)
-    if len(parts) < 3:
-        await message.answer(
-            "❌ Noto'g'ri format. Iltimos ko'rsatilganidek kiriting:\n@KanalID https://t.me/Link Kanal Nomi"
-        )
-        return
-
-    ch_id, ch_url, ch_name = parts
-    if not ch_url.startswith("http"):
-        await message.answer("❌ Link 'http' ishtirok etishi shart.")
-        return
-
-    await add_sponsor_channel(ch_id, ch_url, ch_name)
-    await message.answer(
-        f"✅ Kanal ajoyib qo'shildi:\nID: {ch_id}\nLInk: {ch_url}\nNomi: {ch_name}"
-    )
-    await state.clear()
-
-    # Refresh menu
-    message.text = CHANNELS_BUTTON
-    await admin_channels_menu(message, state)
-
-
-@router.callback_query(F.data.startswith("del_channel:"))
-async def handle_delete_channel(
-    callback: types.CallbackQuery, state: FSMContext
-) -> None:
-    if not await _ensure_callback_access(callback, permission="channels"):
-        await callback.answer("Ruxsatingiz yo'q", show_alert=True)
-        return
-
-    ch_id = callback.data.split(":", 1)[1]
-    await remove_sponsor_channel(ch_id)
-    await callback.answer("✅ Kanal o'chirildi")
-
-    callback.message.text = CHANNELS_BUTTON
-    old_from = callback.message.from_user
-    callback.message.from_user = callback.from_user
-    await admin_channels_menu(callback.message, state)
-    callback.message.from_user = old_from
-
-
 # UI overrides
 
-from .admin_runtime_helpers import (
+from .admin_texts import (
     _ad_duration_prompt,
     _build_ads_panel_text,
     _build_dashboard_caption,
     _build_stats_insights,
-    _content_kind_icon,
     _content_list_filter_label,
-    _format_recent_users,
     _helper_admin_permission_label,
     _render_content_picker_text,
     _render_content_section_page,

@@ -1,6 +1,11 @@
+import logging
 import time
 from typing import Any, Awaitable, Callable, Dict
+
+logger = logging.getLogger(__name__)
+
 from aiogram import BaseMiddleware
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import Message, CallbackQuery
 
 
@@ -16,7 +21,9 @@ class AntiSpamMiddleware(BaseMiddleware):
         data: Dict[str, Any],
     ) -> Any:
 
-        # Odatda rate limit faqat Message lar uchun, lekin CallbackQuery larni ham himoya qilish mumkin.
+        if event.from_user is None:
+            return await handler(event, data)
+
         user_id = event.from_user.id
         now = time.monotonic()
 
@@ -28,7 +35,7 @@ class AntiSpamMiddleware(BaseMiddleware):
                     await event.answer(
                         "Juda tez yuboryapsiz, biroz kuting...", show_alert=False
                     )
-                except Exception:
+                except (TelegramBadRequest, TelegramForbiddenError):
                     pass
             return
 

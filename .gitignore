@@ -64,12 +64,14 @@ venv.bak/
 # SQLite
 *.sqlite
 *.db
-!movies.db
 *.db-wal
 *.db-shm
 # Runtime state
 *.pid
 .stats_webapp_url
+# Backup files
+*.bak
+
 # Misc
 /.cache
 /_local
