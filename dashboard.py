@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 

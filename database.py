@@ -1,8 +1,11 @@
 import asyncio
+import logging
 import shutil
 import sqlite3
 import re
 from contextlib import closing, suppress
+
+logger = logging.getLogger(__name__)
 from datetime import UTC, datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 from time import monotonic
@@ -45,12 +48,28 @@ ADMIN_PERMISSION_COLUMNS = {
     "channels": "can_manage_channels",
 }
 
+CACHE_MAX_MOVIES = 10_000
+CACHE_MAX_SERIAL_GROUPS = 2_000
+CACHE_MAX_FAVORITES = 20_000
+CACHE_MAX_USER_ACTIVITY = 10_000
+CACHE_MAX_VIEW_EXCLUSION = 5_000
+
 db: aiosqlite.Connection | None = None
 movie_cache: dict[str, tuple[str, str, str, str]] = {}
 serial_group_cache: dict[str, tuple[str, str, str, str]] = {}
 fav_cache: dict[int, set[str]] = {}
 user_activity_cache: dict[int, tuple[float, str]] = {}
 view_tracking_exclusion_cache: dict[int, bool] = {}
+
+
+def _trim_cache(cache: dict, max_size: int) -> None:
+    """Cache hajmi chegaradan oshsa, eng eski yozuvlarni o'chiradi."""
+    if len(cache) <= max_size:
+        return
+    excess = len(cache) - max_size
+    keys_to_remove = list(cache.keys())[:excess]
+    for key in keys_to_remove:
+        cache.pop(key, None)
 channels_cache: list[dict[str, str]] | None = None
 
 
@@ -1193,6 +1212,7 @@ async def add_movie(
         file_id,
         normalized_kind,
     )
+    _trim_cache(movie_cache, CACHE_MAX_MOVIES)
     return True
 
 
@@ -1288,6 +1308,7 @@ async def touch_user(
 
     await connection.commit()
     user_activity_cache[user_id] = (now_monotonic, today_key)
+    _trim_cache(user_activity_cache, CACHE_MAX_USER_ACTIVITY)
 
 
 async def mark_user_blocked(
@@ -1482,6 +1503,7 @@ async def upsert_helper_admin(
     )
     await connection.commit()
     view_tracking_exclusion_cache[user_id] = True
+    _trim_cache(view_tracking_exclusion_cache, CACHE_MAX_VIEW_EXCLUSION)
 
 
 async def set_helper_admin_permission(
@@ -1527,6 +1549,7 @@ async def _is_view_tracking_excluded(user_id: int) -> bool:
 
     excluded = row is not None
     view_tracking_exclusion_cache[user_id] = excluded
+    _trim_cache(view_tracking_exclusion_cache, CACHE_MAX_VIEW_EXCLUSION)
     return excluded
 
 
@@ -1653,6 +1676,7 @@ async def get_movie(code: str) -> tuple[str, str, str, str] | None:
             data[2],
             _normalize_content_kind(data[3]),
         )
+        _trim_cache(movie_cache, CACHE_MAX_MOVIES)
 
     return movie_cache.get(code)
 
@@ -2234,6 +2258,7 @@ async def get_serial_group(code: str) -> tuple[str, str, str] | None:
         return None
 
     serial_group_cache[row[0]] = _serial_group_entry(row[1], row[2])
+    _trim_cache(serial_group_cache, CACHE_MAX_SERIAL_GROUPS)
     return row[0], row[1], row[2]
 
 
@@ -2465,6 +2490,7 @@ async def get_favorites(user_id: int) -> list[tuple[str]]:
         data = await cursor.fetchall()
 
     fav_cache[user_id] = {code for (code,) in data}
+    _trim_cache(fav_cache, CACHE_MAX_FAVORITES)
     return data
 
 

@@ -1,5 +1,9 @@
 """Presentation helpers for user-facing content flows."""
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 from html import escape
 
 from aiogram import types

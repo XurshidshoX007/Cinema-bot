@@ -1,3 +1,7 @@
+import logging
+
+logger = logging.getLogger(__name__)
+
 import re
 import time
 from typing import Any, Awaitable, Callable, Dict, Set, Pattern

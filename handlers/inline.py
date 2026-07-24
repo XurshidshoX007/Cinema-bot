@@ -1,3 +1,7 @@
+import logging
+
+logger = logging.getLogger(__name__)
+
 import re
 from html import escape
 from urllib.parse import quote

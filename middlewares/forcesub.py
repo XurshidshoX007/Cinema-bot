@@ -264,6 +264,9 @@ class ForceSubMiddleware(BaseMiddleware):
 
 @router.callback_query(F.data == "check_subscription")
 async def check_sub_handler(callback: CallbackQuery, bot: Bot) -> None:
+    if callback.from_user is None:
+        await callback.answer()
+        return
     user_id = callback.from_user.id
     unsubscribed, unknown = await get_channel_access_report(bot, user_id)
 

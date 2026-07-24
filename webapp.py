@@ -1,3 +1,4 @@
+import logging
 from contextlib import suppress
 from datetime import datetime, timedelta, UTC
 from html import escape
@@ -8,6 +9,8 @@ from pathlib import Path
 import os
 import re
 import socket
+
+logger = logging.getLogger(__name__)
 import sqlite3
 import sys
 import time

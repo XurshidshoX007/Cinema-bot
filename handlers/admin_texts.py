@@ -2,7 +2,8 @@
 
 import logging
 from html import escape
-from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 logger = logging.getLogger(__name__)
 

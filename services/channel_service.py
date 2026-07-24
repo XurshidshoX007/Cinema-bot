@@ -1,5 +1,9 @@
 """Presentation and parsing helpers for sponsor channels."""
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 from aiogram import types
 
 from database import get_sponsor_channels

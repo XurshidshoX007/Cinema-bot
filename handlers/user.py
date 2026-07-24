@@ -27,7 +27,6 @@ from keyboards import (
     REQUEST_BUTTON,
     SEARCH_BUTTON,
     USER_ACTIONS,
-    main_menu,
     serial_hub_keyboard,
 )
 from database import (

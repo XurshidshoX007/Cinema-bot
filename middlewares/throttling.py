@@ -17,7 +17,9 @@ class AntiSpamMiddleware(BaseMiddleware):
         data: Dict[str, Any],
     ) -> Any:
 
-        # Odatda rate limit faqat Message lar uchun, lekin CallbackQuery larni ham himoya qilish mumkin.
+        if event.from_user is None:
+            return await handler(event, data)
+
         user_id = event.from_user.id
         now = time.monotonic()
 
