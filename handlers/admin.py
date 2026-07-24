@@ -3720,7 +3720,11 @@ async def accept_request(callback: types.CallbackQuery, state: FSMContext) -> No
         await callback.answer("Xabar topilmadi", show_alert=True)
         return
 
-    rid = int(callback.data.split("_", 1)[1])
+    try:
+        rid = int(callback.data.split("_", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Noto'g'ri so'rov", show_alert=True)
+        return
     request = await get_request(rid)
     if not request:
         await callback.answer("Bu so'rov topilmadi", show_alert=True)
@@ -3918,7 +3922,11 @@ async def reject_request(callback: types.CallbackQuery) -> None:
         await callback.answer("Xabar topilmadi", show_alert=True)
         return
 
-    rid = int(callback.data.split("_", 1)[1])
+    try:
+        rid = int(callback.data.split("_", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Noto'g'ri so'rov", show_alert=True)
+        return
     request = await get_request(rid)
     if not request:
         await callback.answer("Bu so'rov topilmadi", show_alert=True)
