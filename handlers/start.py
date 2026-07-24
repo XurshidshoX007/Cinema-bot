@@ -7,7 +7,7 @@ from aiogram.fsm.context import FSMContext
 logger = logging.getLogger(__name__)
 
 from keyboards import main_menu
-from repositories.users import is_admin_user
+from database import is_admin_user
 from services.telegram_context import touch_message_user
 
 router = Router()

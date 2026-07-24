@@ -1,6 +1,6 @@
 from . import (
     admin,
-    admin_text_refined,
+    admin_texts,
     admin_ui,
     channel_fix,
     chat_member,

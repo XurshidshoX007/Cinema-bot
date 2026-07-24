@@ -10,7 +10,7 @@ from aiogram.types import (
     InputTextMessageContent,
 )
 
-from repositories.content import get_movie, get_serial_group_for_lookup, search_movies_by_text
+from database import get_movie, get_serial_group_for_lookup, search_movies_by_text
 
 router = Router()
 CODE_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]+")

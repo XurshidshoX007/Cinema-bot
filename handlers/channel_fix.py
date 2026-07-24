@@ -9,7 +9,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 
 from keyboards import ADMIN_ACTIONS, CHANNELS_BUTTON, USER_ACTIONS
-from repositories.channels import add_sponsor_channel, remove_sponsor_channel
+from database import add_sponsor_channel, remove_sponsor_channel
 from services.channel_service import (
     CHANNEL_INPUT_ERROR_TEXT,
     build_channels_menu_view,
@@ -17,9 +17,33 @@ from services.channel_service import (
     parse_channel_submission,
 )
 
-from . import admin_facade, user
+from . import admin as _admin, user
 
 router = Router()
+
+AdminChannelState = _admin.AdminChannelState
+
+
+async def _ensure_message_access(
+    message: types.Message,
+    *,
+    permission: str | None = None,
+    owner_only: bool = False,
+) -> bool:
+    return await _admin._ensure_message_access(
+        message, permission=permission, owner_only=owner_only,
+    )
+
+
+async def _ensure_callback_access(
+    callback: types.CallbackQuery,
+    *,
+    permission: str | None = None,
+    owner_only: bool = False,
+) -> bool:
+    return await _admin._ensure_callback_access(
+        callback, permission=permission, owner_only=owner_only,
+    )
 
 
 async def _show_channels_menu(
@@ -44,21 +68,21 @@ async def _show_channels_menu(
             disable_web_page_preview=True,
         )
 
-    await state.set_state(admin_facade.AdminChannelState.waiting_for_channel)
+    await state.set_state(AdminChannelState.waiting_for_channel)
 
 
 @router.message(F.text == CHANNELS_BUTTON)
 async def admin_channels_menu(message: types.Message, state: FSMContext) -> None:
-    if not await admin_facade.ensure_message_access(message, permission="channels"):
+    if not await _ensure_message_access(message, permission="channels"):
         return
 
     await state.clear()
     await _show_channels_menu(message, state)
 
 
-@router.message(admin_facade.AdminChannelState.waiting_for_channel)
+@router.message(AdminChannelState.waiting_for_channel)
 async def receive_new_channel(message: types.Message, state: FSMContext) -> None:
-    if not await admin_facade.ensure_message_access(message, permission="channels"):
+    if not await _ensure_message_access(message, permission="channels"):
         return
 
     if not message.text:
@@ -67,7 +91,7 @@ async def receive_new_channel(message: types.Message, state: FSMContext) -> None
 
     if message.text in ADMIN_ACTIONS:
         await state.clear()
-        await admin_facade.admin_global_handler(message, state)
+        await _admin.admin_global_handler(message, state)
         return
 
     if message.text in USER_ACTIONS:
@@ -100,7 +124,7 @@ async def receive_new_channel(message: types.Message, state: FSMContext) -> None
 async def handle_delete_channel(
     callback: types.CallbackQuery, state: FSMContext
 ) -> None:
-    if not await admin_facade.ensure_callback_access(callback, permission="channels"):
+    if not await _ensure_callback_access(callback, permission="channels"):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
 

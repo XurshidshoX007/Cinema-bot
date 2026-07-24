@@ -3976,143 +3976,14 @@ async def send_request_review(
             video=file_id, caption=review_text, reply_markup=keyboard
         )
 
-
-# Balanced premium text overrides
-# ======================
-# 📢 MAJBURIY KANALLAR
-# ======================
-
-
-@router.message(F.text == CHANNELS_BUTTON)
-async def admin_channels_menu(message: types.Message, state: FSMContext) -> None:
-    if not await _ensure_message_access(message, permission="channels"):
-        return
-
-    await state.clear()
-    channels = await get_sponsor_channels()
-
-    text = "📢 <b>Majburiy Kanallar (Force Subscription)</b>\n\n"
-    if not channels:
-        text += "<i>Hozircha hech qanday homiy kanal kiritilmagan.</i>\n\n"
-    else:
-        for idx, ch in enumerate(channels, 1):
-            text += f"<b>{idx}.</b> {ch['name']} — (<pre>{ch['id']}</pre>)\n🔗 {ch['url']}\n\n"
-
-    text += "➕ <b>Yangi kanal qo'shish</b>\n\n<i>Ma'lumotlarni bitta xabarda quyidagi ketma-ketlikda yuboring:</i>\n\n"
-    text += "<pre>@KanalID https://t.me/Link Kanal Nomi</pre>\n\n"
-    text += "Masalan:\n<pre>@PrimeCinema https://t.me/PrimeCinema Zo'r Kinolar</pre>"
-
-    # Inline buttons for deletes
-    buttons = []
-    for ch in channels:
-        buttons.append(
-            [
-                types.InlineKeyboardButton(
-                    text=f"🗑 {ch['name']}", callback_data=f"del_channel:{ch['id']}"
-                )
-            ]
-        )
-
-    markup = types.InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
-
-    await message.answer(
-        text, reply_markup=markup, parse_mode="HTML", disable_web_page_preview=True
-    )
-    await state.set_state(AdminChannelState.waiting_for_channel)
-
-
-@router.message(AdminChannelState.waiting_for_channel)
-async def receive_new_channel(message: types.Message, state: FSMContext) -> None:
-    if not await _ensure_message_access(message, permission="channels"):
-        return
-
-    if not message.text:
-        await message.answer(
-            "❌ Iltimos, matn yuboring.\n@KanalID https://t.me/Link Kanal Nomi"
-        )
-        return
-
-    if message.text in ADMIN_ACTIONS + USER_ACTIONS:
-        await state.clear()
-        return  # user pressed another menu button
-
-    parts = message.text.split(maxsplit=2)
-    if len(parts) < 3:
-        await message.answer(
-            "❌ Noto'g'ri format. Iltimos ko'rsatilganidek kiriting:\n@KanalID https://t.me/Link Kanal Nomi"
-        )
-        return
-
-    ch_id, ch_url, ch_name = parts
-    if not ch_url.startswith("http"):
-        await message.answer("❌ Link 'http' ishtirok etishi shart.")
-        return
-
-    await add_sponsor_channel(ch_id, ch_url, ch_name)
-    await message.answer(
-        f"✅ Kanal ajoyib qo'shildi:\nID: {ch_id}\nLink: {ch_url}\nNomi: {ch_name}"
-    )
-    await state.clear()
-
-    # Refresh menu (message mutatsiyasiz)
-    await admin_channels_menu(message, state)
-
-
-@router.callback_query(F.data.startswith("del_channel:"))
-async def handle_delete_channel(
-    callback: types.CallbackQuery, state: FSMContext
-) -> None:
-    if not await _ensure_callback_access(callback, permission="channels"):
-        await callback.answer("Ruxsatingiz yo'q", show_alert=True)
-        return
-
-    ch_id = callback.data.split(":", 1)[1]
-    await remove_sponsor_channel(ch_id)
-    await callback.answer("✅ Kanal o'chirildi")
-
-    # Kanal menyusini yangilash (message mutatsiyasiz)
-    if callback.message is not None:
-        channels = await get_sponsor_channels()
-        text = "📢 <b>Majburiy Kanallar (Force Subscription)</b>\n\n"
-        if not channels:
-            text += "<i>Hozircha hech qanday homiy kanal kiritilmagan.</i>\n\n"
-        else:
-            for idx, ch in enumerate(channels, 1):
-                text += f"<b>{idx}.</b> {ch['name']} — (<pre>{ch['id']}</pre>)\n🔗 {ch['url']}\n\n"
-        text += "➕ <b>Yangi kanal qo'shish</b>\n\n<i>Ma'lumotlarni bitta xabarda quyidagi ketma-ketlikda yuboring:</i>\n\n"
-        text += "<pre>@KanalID https://t.me/Link Kanal Nomi</pre>\n\n"
-        text += "Masalan:\n<pre>@PrimeCinema https://t.me/PrimeCinema Zo'r Kinolar</pre>"
-
-        buttons = []
-        for ch in channels:
-            buttons.append(
-                [
-                    types.InlineKeyboardButton(
-                        text=f"🗑 {ch['name']}", callback_data=f"del_channel:{ch['id']}"
-                    )
-                ]
-            )
-        markup = types.InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
-
-        try:
-            await callback.message.edit_text(
-                text, reply_markup=markup, parse_mode="HTML", disable_web_page_preview=True
-            )
-        except TelegramBadRequest:
-            pass
-    await state.set_state(AdminChannelState.waiting_for_channel)
-
-
 # UI overrides
 
-from .admin_runtime_helpers import (
+from .admin_texts import (
     _ad_duration_prompt,
     _build_ads_panel_text,
     _build_dashboard_caption,
     _build_stats_insights,
-    _content_kind_icon,
     _content_list_filter_label,
-    _format_recent_users,
     _helper_admin_permission_label,
     _render_content_picker_text,
     _render_content_section_page,

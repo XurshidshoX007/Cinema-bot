@@ -6,7 +6,7 @@ from aiogram.exceptions import TelegramBadRequest
 logger = logging.getLogger(__name__)
 
 from keyboards import movie_buttons, serial_hub_keyboard
-from repositories.content import (
+from database import (
     add_favorite,
     get_serial_episodes,
     get_serial_group_for_lookup,

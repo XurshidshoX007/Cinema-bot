@@ -2,7 +2,7 @@
 
 from aiogram import types
 
-from repositories.users import touch_user
+from database import touch_user
 
 
 async def touch_message_user(message: types.Message) -> None:

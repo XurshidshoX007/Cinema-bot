@@ -143,66 +143,6 @@ def _render_helper_admin_detail(helper_admin: dict[str, object]) -> str:
     )
 
 
-def _render_content_section_page(
-    items: list[tuple[str, str, str]],
-    *,
-    filter_key: str,
-    page: int,
-) -> tuple[str, int, int]:
-    total_items = len(items)
-    total_pages = max(
-        1,
-        (total_items + admin.CONTENT_LIST_PAGE_SIZE - 1)
-        // admin.CONTENT_LIST_PAGE_SIZE,
-    )
-    page = min(max(page, 0), total_pages - 1)
-    start = page * admin.CONTENT_LIST_PAGE_SIZE
-    end = min(total_items, start + admin.CONTENT_LIST_PAGE_SIZE)
-    page_items = items[start:end]
-
-    lines = [
-        "🎞 Kontent ro'yxati",
-        f"Bo'lim: {_content_list_filter_label(filter_key)}",
-        f"Jami: {total_items} ta",
-    ]
-
-    if total_items:
-        lines.extend([f"Sahifa: {page + 1}/{total_pages}", ""])
-        for absolute_index, (code, title, _content_kind) in enumerate(
-            page_items, start=start + 1
-        ):
-            lines.append(f"{absolute_index}. {title}")
-            lines.append(f"   Kod: {code}")
-    else:
-        lines.extend(["", "Hozircha kontent yo'q."])
-
-    return "\n".join(lines), total_pages, page
-
-
-def _render_content_picker_text(
-    *,
-    title: str,
-    movie_count: int,
-    serial_count: int,
-    empty_text: str,
-    hint_text: str,
-) -> str:
-    total_count = movie_count + serial_count
-    if total_count == 0:
-        return empty_text
-
-    return "\n".join(
-        [
-            title,
-            f"Jami: {total_count}",
-            f"Kinolar: {movie_count}",
-            f"Seriallar: {serial_count}",
-            "",
-            hint_text,
-        ]
-    )
-
-
 def _render_delete_panel_text(
     *,
     filter_key: str,
@@ -380,40 +320,6 @@ def _build_dashboard_caption(panel: str, payload: dict) -> str:
     )
 
 
-async def _show_stats_webapp(message: types.Message) -> None:
-    # Avval bot ichidagi dashboard chiqadi, shunda webapp havolasi ishlamasa ham bo'lim ishlaydi.
-    try:
-        await admin._show_stats_dashboard(message, panel="overview", edit=False)
-    except Exception:
-        summary = await admin.get_dashboard_summary()
-        await message.answer(
-            "\n".join(
-                [
-                    "📊 Statistika",
-                    f"Faol obunachilar: {summary['total_users']}",
-                    f"Jami kirganlar: {summary['all_time_users']}",
-                    f"Bugun kirganlar: {summary['entered_today']}",
-                    f"Bugun yangi obunachilar: {summary['new_subscribers_today']}",
-                    f"Bloklaganlar: {summary['blocked_users']}",
-                    f"24 soat faol: {summary['active_today']}",
-                    f"7 kun faol: {summary['active_week']}",
-                    f"Kontent: {summary['total_movies']}",
-                    f"So'rovlar: {summary['total_requests']}",
-                ]
-            )
-        )
-
-    stats_url = _runtime_stats_webapp_url()
-    if stats_url:
-        user_id = message.from_user.id if message.from_user is not None else 0
-        await message.answer(
-            "🌐 Batafsil web-panel uchun tugmani bosing:",
-            reply_markup=admin.stats_webapp_keyboard(
-                build_signed_stats_webapp_url(stats_url, user_id)
-            ),
-        )
-
-
 async def _show_serial_mode_picker(
     message: types.Message,
     state: FSMContext,
@@ -551,31 +457,6 @@ async def _start_serial_continuation_flow(
     )
 
 
-async def _show_serial_continue_prompt(
-    message: types.Message,
-    state: FSMContext,
-    title: str,
-    next_episode_number: int,
-) -> None:
-    await state.clear()
-    await state.set_state(admin.AddMovieState.waiting_for_serial_continue)
-    await state.update_data(
-        content_kind="serial",
-        series_title=title,
-        episode_number=next_episode_number,
-    )
-    await message.answer(
-        (
-            "✅ <b>Qism qo'shildi</b>\n\n"
-            f"🎞 {_safe_html(title)}\n"
-            f"📌 Keyingi qism: {next_episode_number}\n\n"
-            "<i>Davom ettirasizmi?</i>"
-        ),
-        reply_markup=admin.serial_continue_keyboard(),
-        parse_mode="HTML",
-    )
-
-
 async def _start_add_movie_flow(
     message: types.Message,
     state: FSMContext,
@@ -641,60 +522,6 @@ def _ad_duration_prompt() -> str:
         "Masalan: 45m, 2h, 1d.\n"
         f"Oraliq: {admin._ad_duration_limits_text()}."
     )
-
-
-async def _show_content_list(
-    message: types.Message,
-    *,
-    filter_key: str | None = None,
-    page: int = 0,
-    edit: bool = False,
-) -> None:
-    movies = await admin.get_all_movies()
-    if not movies:
-        text = "🎞 Hozircha kontent qo'shilmagan."
-        reply_markup = None
-    else:
-        movie_items = [movie for movie in movies if movie[2] == "movie"]
-        serial_items = [movie for movie in movies if movie[2] == "serial"]
-
-        normalized_filter = filter_key if filter_key in {"movie", "serial"} else None
-        if normalized_filter == "movie":
-            text, total_pages, current_page = _render_content_section_page(
-                movie_items,
-                filter_key="movie",
-                page=page,
-            )
-        elif normalized_filter == "serial":
-            text, total_pages, current_page = _render_content_section_page(
-                serial_items,
-                filter_key="serial",
-                page=page,
-            )
-        else:
-            text = _render_content_picker_text(
-                title="🎞 Kontent",
-                movie_count=len(movie_items),
-                serial_count=len(serial_items),
-                empty_text="🎞 Hozircha kontent qo'shilmagan.",
-                hint_text="Kerakli bo'limni tanlang.",
-            )
-            total_pages = 1
-            current_page = 0
-
-        reply_markup = admin.content_list_keyboard(
-            active_filter=normalized_filter,
-            movie_count=len(movie_items),
-            serial_count=len(serial_items),
-            page=current_page,
-            total_pages=total_pages,
-        )
-
-    if edit:
-        await message.edit_text(text, reply_markup=reply_markup)
-        return
-
-    await message.answer(text, reply_markup=reply_markup)
 
 
 async def _show_delete_panel(
@@ -775,7 +602,7 @@ async def _show_delete_panel(
     await message.answer(text, reply_markup=reply_markup, parse_mode="HTML")
 
 
-async def _show_stats_webapp_restored(message: types.Message) -> None:
+async def _show_stats_webapp(message: types.Message) -> None:
     summary = await admin.get_dashboard_summary()
     stats_url = _runtime_stats_webapp_url()
     text = (
@@ -1002,27 +829,3 @@ async def _show_serial_continue_prompt(
     )
 
 
-admin._request_text = _request_text
-admin._request_added_text = _request_added_text
-admin._request_rejected_text = _request_rejected_text
-admin._content_list_filter_label = _content_list_filter_label
-admin._helper_admin_permission_label = _helper_admin_permission_label
-admin._render_helper_admins_panel = _render_helper_admins_panel
-admin._render_helper_admin_detail = _render_helper_admin_detail
-admin._render_content_section_page = _render_content_section_page
-admin._render_content_picker_text = _render_content_picker_text
-admin._render_delete_panel_text = _render_delete_panel_text
-admin._build_ads_panel_text = _build_ads_panel_text
-admin._build_stats_insights = _build_stats_insights
-admin._build_dashboard_caption = _build_dashboard_caption
-admin._show_stats_webapp = _show_stats_webapp_restored
-admin._show_serial_mode_picker = _show_serial_mode_picker
-admin._show_serial_titles_picker = _show_serial_titles_picker
-admin._start_serial_continuation_flow = _start_serial_continuation_flow
-admin._show_serial_continue_prompt = _show_serial_continue_prompt
-admin._start_add_movie_flow = _start_add_movie_flow
-admin._ad_duration_prompt = _ad_duration_prompt
-admin._show_content_list = _show_content_list
-admin._show_delete_panel = _show_delete_panel
-admin.show_requests = show_requests
-admin.send_request_review = send_request_review

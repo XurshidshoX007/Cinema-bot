@@ -30,7 +30,7 @@ from keyboards import (
     main_menu,
     serial_hub_keyboard,
 )
-from repositories.content import (
+from database import (
     add_history,
     count_favorites,
     count_history,
@@ -48,9 +48,9 @@ from repositories.content import (
     log_user_search_event,
     record_movie_view,
 )
-from repositories.channels import get_sponsor_channels
-from repositories.requests import add_request
-from repositories.users import has_feature_trial_used, is_admin_user, mark_feature_trial_used
+from database import get_sponsor_channels
+from database import add_request
+from database import has_feature_trial_used, is_admin_user, mark_feature_trial_used
 from services.legacy_media import (
     legacy_media_enabled,
     renew_file_id_as_video,

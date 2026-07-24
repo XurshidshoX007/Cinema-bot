@@ -12,7 +12,7 @@ from aiogram.exceptions import (
 from aiogram.types import Message
 
 from config import ADMIN_ID, LEGACY_BOT_TOKEN, LEGACY_MEDIA_BRIDGE_CHAT_ID
-from repositories.content import get_movie, update_movie_file_id
+from database import get_movie, update_movie_file_id
 
 logger = logging.getLogger(__name__)
 _legacy_bot: Bot | None = None

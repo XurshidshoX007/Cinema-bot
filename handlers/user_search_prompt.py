@@ -2,7 +2,7 @@ from aiogram import F, Router, types
 from aiogram.fsm.context import FSMContext
 
 from keyboards import LEGACY_SEARCH_BUTTON, SEARCH_BUTTON, main_menu
-from repositories.users import is_admin_user
+from database import is_admin_user
 from services.telegram_context import touch_message_user
 
 from .user import KinoState

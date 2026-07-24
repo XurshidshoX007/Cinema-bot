@@ -2,7 +2,7 @@
 
 from aiogram import types
 
-from repositories.channels import get_sponsor_channels
+from database import get_sponsor_channels
 
 CHANNEL_INPUT_EXAMPLE = "<pre>@kanal_id https://t.me/link Kanal nomi</pre>"
 CHANNEL_INPUT_ERROR_TEXT = "Format noto'g'ri.\n" f"{CHANNEL_INPUT_EXAMPLE}"

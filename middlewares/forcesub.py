@@ -10,8 +10,8 @@ from aiogram.types import (
     Message,
 )
 
-from repositories.channels import get_sponsor_channels
-from repositories.users import (
+from database import get_sponsor_channels
+from database import (
     has_feature_trial_used,
     is_admin_user,
     mark_feature_trial_used,
