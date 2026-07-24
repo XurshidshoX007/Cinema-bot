@@ -1,0 +1,24 @@
+version: "3.9"
+
+services:
+  bot:
+    build: .
+    env_file: .env
+    volumes:
+      - bot-data:/app/data
+    restart: unless-stopped
+    depends_on:
+      - webapp
+
+  webapp:
+    build: .
+    command: python webapp.py
+    env_file: .env
+    ports:
+      - "${WEBAPP_PORT:-8080}:8080"
+    volumes:
+      - bot-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  bot-data:

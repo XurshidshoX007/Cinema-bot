@@ -79,7 +79,6 @@ from keyboards import (
     NEW_SERIAL_BUTTON,
     REQUESTS_BUTTON,
     STATS_BUTTON,
-    USER_ACTIONS,
     ad_duration_keyboard,
     admin_menu,
     ads_panel_keyboard,

@@ -1,5 +1,9 @@
+import logging
 import time
 from typing import Any, Awaitable, Callable, Dict
+
+logger = logging.getLogger(__name__)
+
 from aiogram import BaseMiddleware
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import Message, CallbackQuery
