@@ -3,6 +3,8 @@ import logging
 from contextlib import suppress
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
 from aiogram import Bot, types
 from aiogram.exceptions import (
     TelegramBadRequest,

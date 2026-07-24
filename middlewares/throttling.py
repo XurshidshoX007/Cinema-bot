@@ -1,6 +1,7 @@
 import time
 from typing import Any, Awaitable, Callable, Dict
 from aiogram import BaseMiddleware
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import Message, CallbackQuery
 
 
@@ -28,7 +29,7 @@ class AntiSpamMiddleware(BaseMiddleware):
                     await event.answer(
                         "Juda tez yuboryapsiz, biroz kuting...", show_alert=False
                     )
-                except Exception:
+                except (TelegramBadRequest, TelegramForbiddenError):
                     pass
             return
 

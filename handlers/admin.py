@@ -1,6 +1,9 @@
+import logging
 import re
 from datetime import UTC, datetime
 from html import escape
+
+logger = logging.getLogger(__name__)
 
 from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
@@ -81,6 +84,7 @@ from keyboards import (
     NEW_SERIAL_BUTTON,
     REQUESTS_BUTTON,
     STATS_BUTTON,
+    USER_ACTIONS,
     ad_duration_keyboard,
     admin_menu,
     ads_panel_keyboard,
@@ -189,6 +193,8 @@ async def _ensure_message_access(
     permission: str | None = None,
     owner_only: bool = False,
 ) -> bool:
+    if message.from_user is None:
+        return False
     user_id = message.from_user.id
     if owner_only:
         return _is_owner(user_id)
@@ -203,6 +209,8 @@ async def _ensure_callback_access(
     permission: str | None = None,
     owner_only: bool = False,
 ) -> bool:
+    if callback.from_user is None:
+        return False
     user_id = callback.from_user.id
     if owner_only:
         return _is_owner(user_id)
@@ -338,13 +346,6 @@ def _serial_description_prompt_text(title: str, episode_number: int) -> str:
     return (
         f"📝 <b>{_safe_html(title)}</b>\n"
         f"\n<i>{episode_number}-qism uchun tavsif yuboring</i>"
-    )
-
-
-def _serial_video_prompt_text(title: str, episode_number: int) -> str:
-    return (
-        f"🎬 <b>{_safe_html(title)}</b>\n"
-        f"\n<i>{episode_number}-qism videosini yuboring</i>"
     )
 
 
@@ -1638,7 +1639,7 @@ async def _launch_ad_campaign(
 
 @router.message(Command("shutdown"))
 async def shutdown_bot(message: types.Message, dispatcher: Dispatcher) -> None:
-    if not _is_owner(message.from_user.id):
+    if message.from_user is None or not _is_owner(message.from_user.id):
         return
 
     stop_event = dispatcher.get("owner_stop_event")
@@ -2241,19 +2242,19 @@ async def migrate_all_media(message: types.Message) -> None:
     F.text.in_(ADMIN_ACTIONS),
 )
 async def admin_global_handler(message: types.Message, state: FSMContext) -> None:
-    if not await _is_admin(message.from_user.id):
+    user = message.from_user
+    if user is None:
         return
 
-    await touch_user(
-        message.from_user.id,
-        message.from_user.username,
-        message.from_user.full_name,
-    )
+    if not await _is_admin(user.id):
+        return
+
+    await touch_user(user.id, user.username, user.full_name)
 
     text = message.text
     await state.clear()
-    permissions = await _admin_permissions(message.from_user.id)
-    is_owner = _is_owner(message.from_user.id)
+    permissions = await _admin_permissions(user.id)
+    is_owner = _is_owner(user.id)
 
     if text == ADMIN_PANEL_BUTTON:
         await message.answer(
@@ -2331,7 +2332,7 @@ async def admin_global_handler(message: types.Message, state: FSMContext) -> Non
             "⬅️ <b>Asosiy Menyu</b>\n\n<i>Nimani tanlaysiz?</i>",
             parse_mode="HTML",
             reply_markup=main_menu(
-                message.from_user.id, show_admin_panel=bool(permissions)
+                user.id, show_admin_panel=bool(permissions)
             ),
         )
 
@@ -3962,7 +3963,7 @@ async def send_request_review(
         await message.answer_photo(
             photo=file_id, caption=review_text, reply_markup=keyboard
         )
-    except Exception:
+    except TelegramBadRequest:
         await message.answer_video(
             video=file_id, caption=review_text, reply_markup=keyboard
         )
@@ -4017,6 +4018,12 @@ async def receive_new_channel(message: types.Message, state: FSMContext) -> None
     if not await _ensure_message_access(message, permission="channels"):
         return
 
+    if not message.text:
+        await message.answer(
+            "❌ Iltimos, matn yuboring.\n@KanalID https://t.me/Link Kanal Nomi"
+        )
+        return
+
     if message.text in ADMIN_ACTIONS + USER_ACTIONS:
         await state.clear()
         return  # user pressed another menu button
@@ -4035,12 +4042,11 @@ async def receive_new_channel(message: types.Message, state: FSMContext) -> None
 
     await add_sponsor_channel(ch_id, ch_url, ch_name)
     await message.answer(
-        f"✅ Kanal ajoyib qo'shildi:\nID: {ch_id}\nLInk: {ch_url}\nNomi: {ch_name}"
+        f"✅ Kanal ajoyib qo'shildi:\nID: {ch_id}\nLink: {ch_url}\nNomi: {ch_name}"
     )
     await state.clear()
 
-    # Refresh menu
-    message.text = CHANNELS_BUTTON
+    # Refresh menu (message mutatsiyasiz)
     await admin_channels_menu(message, state)
 
 
@@ -4056,11 +4062,37 @@ async def handle_delete_channel(
     await remove_sponsor_channel(ch_id)
     await callback.answer("✅ Kanal o'chirildi")
 
-    callback.message.text = CHANNELS_BUTTON
-    old_from = callback.message.from_user
-    callback.message.from_user = callback.from_user
-    await admin_channels_menu(callback.message, state)
-    callback.message.from_user = old_from
+    # Kanal menyusini yangilash (message mutatsiyasiz)
+    if callback.message is not None:
+        channels = await get_sponsor_channels()
+        text = "📢 <b>Majburiy Kanallar (Force Subscription)</b>\n\n"
+        if not channels:
+            text += "<i>Hozircha hech qanday homiy kanal kiritilmagan.</i>\n\n"
+        else:
+            for idx, ch in enumerate(channels, 1):
+                text += f"<b>{idx}.</b> {ch['name']} — (<pre>{ch['id']}</pre>)\n🔗 {ch['url']}\n\n"
+        text += "➕ <b>Yangi kanal qo'shish</b>\n\n<i>Ma'lumotlarni bitta xabarda quyidagi ketma-ketlikda yuboring:</i>\n\n"
+        text += "<pre>@KanalID https://t.me/Link Kanal Nomi</pre>\n\n"
+        text += "Masalan:\n<pre>@PrimeCinema https://t.me/PrimeCinema Zo'r Kinolar</pre>"
+
+        buttons = []
+        for ch in channels:
+            buttons.append(
+                [
+                    types.InlineKeyboardButton(
+                        text=f"🗑 {ch['name']}", callback_data=f"del_channel:{ch['id']}"
+                    )
+                ]
+            )
+        markup = types.InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+
+        try:
+            await callback.message.edit_text(
+                text, reply_markup=markup, parse_mode="HTML", disable_web_page_preview=True
+            )
+        except TelegramBadRequest:
+            pass
+    await state.set_state(AdminChannelState.waiting_for_channel)
 
 
 # UI overrides

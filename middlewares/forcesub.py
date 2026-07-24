@@ -245,6 +245,14 @@ async def ensure_feature_callback_access(
 
 
 class ForceSubMiddleware(BaseMiddleware):
+    """Force subscription tekshiruvi.
+
+    Hozirda asosiy tekshiruv ``ensure_feature_access`` /
+    ``ensure_feature_callback_access`` funksiyalari orqali amalga
+    oshiriladi.  Middleware sifatida global tekshiruv kerak bo'lsa,
+    shu yerga logika qo'shing.
+    """
+
     async def __call__(
         self,
         handler: Callable[[Message, Dict[str, Any]], Awaitable[Any]],

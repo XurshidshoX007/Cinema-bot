@@ -1,6 +1,10 @@
+import logging
+
 from aiogram import Router, types
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
+
+logger = logging.getLogger(__name__)
 
 from keyboards import main_menu
 from repositories.users import is_admin_user
@@ -37,6 +41,11 @@ def _start_payload(text: str | None) -> str:
 async def start_handler(message: types.Message, state: FSMContext):
     await touch_message_user(message)
     await state.clear()
+
+    user = message.from_user
+    if user is None:
+        return
+
     payload = _start_payload(message.text)
     if payload.startswith(DEEP_LINK_WATCH_PREFIX):
         code = payload[len(DEEP_LINK_WATCH_PREFIX) :].strip()
@@ -46,10 +55,10 @@ async def start_handler(message: types.Message, state: FSMContext):
             await user_handler.open_shared_content(message, code)
             return
 
-    show_admin_panel = await is_admin_user(message.from_user.id)
+    show_admin_panel = await is_admin_user(user.id)
     await message.answer(
         START_TEXT,
-        reply_markup=main_menu(message.from_user.id, show_admin_panel=show_admin_panel),
+        reply_markup=main_menu(user.id, show_admin_panel=show_admin_panel),
     )
     from handlers.user import KinoState
 

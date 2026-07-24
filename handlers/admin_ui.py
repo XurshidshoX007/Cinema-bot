@@ -1,6 +1,10 @@
 """Top-level admin menu text lives in this file."""
 
+import logging
+
 from aiogram import F, Router, types
+
+logger = logging.getLogger(__name__)
 from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 
@@ -38,15 +42,19 @@ def _denied_text() -> str:
 
 @router.message(StateFilter("*"), F.text.in_(ADMIN_ACTIONS))
 async def admin_global_ui_handler(message: types.Message, state: FSMContext) -> None:
-    if not await admin_facade.is_admin(message.from_user.id):
+    user = message.from_user
+    if user is None:
+        return
+
+    if not await admin_facade.is_admin(user.id):
         return
 
     await touch_message_user(message)
 
     text = message.text
     await state.clear()
-    permissions = await admin_facade.get_permissions(message.from_user.id)
-    is_owner = admin_facade.is_owner(message.from_user.id)
+    permissions = await admin_facade.get_permissions(user.id)
+    is_owner = admin_facade.is_owner(user.id)
 
     if text == ADMIN_PANEL_BUTTON:
         await message.answer(
@@ -150,6 +158,6 @@ async def admin_global_ui_handler(message: types.Message, state: FSMContext) -> 
             "🏠 <b>Asosiy menyu</b>\n\n<i>Kerakli bo'limni tanlang.</i>",
             parse_mode="HTML",
             reply_markup=main_menu(
-                message.from_user.id, show_admin_panel=bool(permissions)
+                user.id, show_admin_panel=bool(permissions)
             ),
         )

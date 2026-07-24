@@ -1,6 +1,10 @@
 """Channel management text lives in this file."""
 
+import logging
+
 from aiogram import F, Router, types
+
+logger = logging.getLogger(__name__)
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 
@@ -55,6 +59,10 @@ async def admin_channels_menu(message: types.Message, state: FSMContext) -> None
 @router.message(admin_facade.AdminChannelState.waiting_for_channel)
 async def receive_new_channel(message: types.Message, state: FSMContext) -> None:
     if not await admin_facade.ensure_message_access(message, permission="channels"):
+        return
+
+    if not message.text:
+        await message.answer(CHANNEL_INPUT_ERROR_TEXT, parse_mode="HTML")
         return
 
     if message.text in ADMIN_ACTIONS:

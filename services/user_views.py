@@ -1,4 +1,4 @@
-﻿"""Presentation helpers for user-facing content flows."""
+"""Presentation helpers for user-facing content flows."""
 
 from html import escape
 

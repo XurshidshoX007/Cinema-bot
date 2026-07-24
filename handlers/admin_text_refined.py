@@ -1,9 +1,13 @@
 """Final admin text overrides live in this file; edit here first for admin copy changes."""
 
+import logging
 from html import escape
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
+
 from aiogram import types
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 
 from config import get_stats_webapp_url, is_telegram_compatible_stats_webapp_url
@@ -849,7 +853,7 @@ async def send_request_review(
         await message.answer_photo(
             photo=file_id, caption=review_text, reply_markup=keyboard
         )
-    except Exception:
+    except TelegramBadRequest:
         await message.answer_video(
             video=file_id, caption=review_text, reply_markup=keyboard
         )

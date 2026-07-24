@@ -1,7 +1,11 @@
+import logging
 from datetime import UTC, datetime
 from html import escape
 
+logger = logging.getLogger(__name__)
+
 from aiogram import types
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 
 from config import STATS_WEBAPP_URL
@@ -490,7 +494,7 @@ def _build_dashboard_caption(panel: str, payload: dict) -> str:
         else:
             max_views = max(views for _, _, views, _ in top_movies)
             ranking = "\n".join(
-                f'{index}. {title} ({code})\n{_bar_chart("Ko'rish", views, max_views)} • User: {unique_views}'
+                f"{index}. {title} ({code})\n{_bar_chart('Korish', views, max_views)} • User: {unique_views}"
                 for index, (code, title, views, unique_views) in enumerate(
                     top_movies,
                     start=1,
@@ -919,7 +923,7 @@ async def send_request_review(
         await message.answer_photo(
             photo=file_id, caption=review_text, reply_markup=keyboard
         )
-    except Exception:
+    except TelegramBadRequest:
         await message.answer_video(
             video=file_id, caption=review_text, reply_markup=keyboard
         )

@@ -16,11 +16,15 @@ async def search_prompt(message: types.Message, state: FSMContext) -> None:
     await touch_message_user(message)
     await state.clear()
 
-    show_admin_panel = await is_admin_user(message.from_user.id)
+    user = message.from_user
+    if user is None:
+        return
+
+    show_admin_panel = await is_admin_user(user.id)
     await message.answer(
         SEARCH_PROMPT_TEXT,
         reply_markup=main_menu(
-            message.from_user.id,
+            user.id,
             show_admin_panel=show_admin_panel,
         ),
     )

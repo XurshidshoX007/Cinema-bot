@@ -191,10 +191,22 @@ def _get_db() -> aiosqlite.Connection:
     return db
 
 
+_SAFE_TABLE_NAMES = frozenset({
+    "users", "movies", "serial_groups", "movie_views",
+    "favorites", "history", "requests", "ads", "ad_deliveries",
+    "helper_admins", "sponsor_channels", "content_view_events",
+    "user_search_events", "feature_trials",
+})
+
+
 async def _get_table_columns(
     connection: aiosqlite.Connection,
     table_name: str,
 ) -> set[str]:
+    if table_name not in _SAFE_TABLE_NAMES:
+        raise ValueError(f"Noma'lum jadval nomi: {table_name}")
+    # PRAGMA parametrizatsiya qo'llab-quvvatlamaydi, shuning uchun
+    # faqat whitelist'dagi nomlar qabul qilinadi.
     async with connection.execute(f"PRAGMA table_info({table_name})") as cursor:
         return {str(row[1]) for row in await cursor.fetchall() if len(row) > 1}
 

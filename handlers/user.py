@@ -1,4 +1,4 @@
-﻿"""User-facing text lives in this file; edit strings below to change user copy."""
+"""User-facing text lives in this file; edit strings below to change user copy."""
 
 import asyncio
 import logging
@@ -119,6 +119,9 @@ class CollectionState(StatesGroup):
 @router.message(StateFilter("*"), F.text.in_(USER_GLOBAL_ACTIONS))
 async def user_global_handler(message: types.Message, state: FSMContext) -> None:
     await touch_message_user(message)
+    user = message.from_user
+    if user is None:
+        return
     text = message.text
     await state.clear()
 
@@ -131,9 +134,9 @@ async def user_global_handler(message: types.Message, state: FSMContext) -> None
         )
         await state.set_state(RequestState.waiting_for_request)
     elif text == FAVORITES_BUTTON:
-        await show_favorites(message, message.from_user.id, state=state)
+        await show_favorites(message, user.id, state=state)
     elif text == HISTORY_BUTTON:
-        await show_history(message, message.from_user.id, state=state)
+        await show_history(message, user.id, state=state)
     elif text == HELP_BUTTON:
         await show_help(message)
 
@@ -1205,6 +1208,8 @@ async def _send_movie_by_code(
         await message.answer("Iltimos, kod yuboring.")
         return
 
+    if message.from_user is None:
+        return
     user_id = message.from_user.id
     protect_content = await _should_protect_content(user_id)
     trial_used = await has_feature_trial_used(user_id, FEATURE_SEARCH)
@@ -1423,6 +1428,8 @@ def extract_request_payload(message: types.Message) -> tuple[str | None, str | N
 )
 async def send_request(message: types.Message, state: FSMContext) -> None:
     await touch_message_user(message)
+    if message.from_user is None:
+        return
     user_id = message.from_user.id
     if message.video:
         await message.answer("So'rov uchun faqat matn yoki rasm yuboring. Video qabul qilinmaydi.")
@@ -1574,7 +1581,7 @@ async def show_history(
 @router.callback_query(F.data.startswith(SHARE_CALLBACK_PREFIX))
 async def share_content_callback(callback: types.CallbackQuery) -> None:
     await touch_callback_user(callback)
-    if callback.message is None:
+    if callback.from_user is None or callback.message is None:
         await callback.answer()
         return
 
@@ -1633,6 +1640,9 @@ async def share_content_callback(callback: types.CallbackQuery) -> None:
 @router.callback_query(F.data.startswith(CHANNEL_SHARE_CALLBACK_PREFIX))
 async def send_serial_share_to_channel(callback: types.CallbackQuery) -> None:
     await touch_callback_user(callback)
+    if callback.from_user is None:
+        await callback.answer()
+        return
     if not await is_admin_user(callback.from_user.id):
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
@@ -1737,7 +1747,7 @@ async def favorites_page(
     state: FSMContext,
 ) -> None:
     await touch_callback_user(callback)
-    if callback.message is None:
+    if callback.from_user is None or callback.message is None:
         await callback.answer()
         return
 
@@ -1754,7 +1764,7 @@ async def favorites_page(
 @router.callback_query(F.data.startswith(f"{HISTORY_PAGE_PREFIX}_"))
 async def history_page(callback: types.CallbackQuery, state: FSMContext) -> None:
     await touch_callback_user(callback)
-    if callback.message is None:
+    if callback.from_user is None or callback.message is None:
         await callback.answer()
         return
 
@@ -1771,7 +1781,7 @@ async def history_page(callback: types.CallbackQuery, state: FSMContext) -> None
 @router.callback_query(F.data.startswith("shub:"))
 async def serial_hub_page(callback: types.CallbackQuery) -> None:
     await touch_callback_user(callback)
-    if callback.message is None:
+    if callback.from_user is None or callback.message is None:
         await callback.answer()
         return
 
@@ -1822,7 +1832,7 @@ async def serial_hub_page(callback: types.CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("sepi:"))
 async def serial_episode_open(callback: types.CallbackQuery) -> None:
     await touch_callback_user(callback)
-    if callback.message is None:
+    if callback.from_user is None or callback.message is None:
         await callback.answer()
         return
 
@@ -1932,6 +1942,8 @@ async def collection_code_search(message: types.Message, state: FSMContext) -> N
         await message.answer("Kod yuboring.")
         return
 
+    if message.from_user is None:
+        return
     user_id = message.from_user.id
     current_state = await state.get_state()
     if current_state == CollectionState.viewing_favorites.state:
