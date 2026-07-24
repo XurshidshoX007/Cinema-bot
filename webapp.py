@@ -1,26 +1,25 @@
+import asyncio
 import logging
-from contextlib import suppress
-from datetime import datetime, timedelta, UTC
-from html import escape
-from http.server import HTTPServer, BaseHTTPRequestHandler
 import ipaddress
 import json
-from pathlib import Path
 import os
 import re
-import socket
-
-logger = logging.getLogger(__name__)
 import sqlite3
 import sys
 import time
+from contextlib import suppress
+from datetime import datetime, timedelta, UTC
+from html import escape
+from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse, urlsplit
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
-# Register datetime adapter for sqlite3
+# Register datetime adapter
 sqlite3.register_adapter(datetime, lambda dt: dt.isoformat())
 sqlite3.register_converter("timestamp", lambda s: datetime.fromisoformat(s.decode()))
+
+from http.server import BaseHTTPRequestHandler
+from aiohttp import web, ClientSession
+from aiohttp.web import StreamResponse
 
 from config import ADMIN_ID, BOT_TOKEN, get_stats_webapp_url
 from database import (
@@ -42,6 +41,8 @@ from services.stats_webapp_auth import (
     verify_telegram_webapp_init_data,
 )
 
+logger = logging.getLogger(__name__)
+
 PORT = int(os.environ.get("WEBAPP_PORT", "8080"))
 DEEP_LINK_WATCH_PREFIX = "watch_"
 SHARE_MEDIA_ROUTE_PREFIX = "/share-media/"
@@ -58,15 +59,6 @@ REQUEST_STATUS_FILTERS = {
     "other": "Boshqa statuslar",
 }
 _REQUEST_HOST_RE = re.compile(r"^\[?[A-Za-z0-9:.%-]+\]?(?::\d{1,5})?$")
-
-
-class ReusableHTTPServer(HTTPServer):
-    allow_reuse_address = False
-
-    def server_bind(self) -> None:
-        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-        super().server_bind()
 
 
 def _format_number(value: int) -> str:
@@ -3211,241 +3203,569 @@ def _build_dashboard_page(
     )
 
 
+
+
+
 _cache = {"payload": None, "timestamp": 0.0}
 CACHE_TTL = 30
 
+# ========== AIOHTTP ADAPTED HELPERS ==========
 
-class SimpleHandler(BaseHTTPRequestHandler):
-    server_version = "Cinema"
-    sys_version = ""
+def _get_host_from_request(request: web.Request, fallback: str) -> str:
+    raw_host = (request.headers.get("Host") or "").strip()
+    candidate = raw_host.split("/", 1)[0].split("\\", 1)[0]
+    if candidate and _REQUEST_HOST_RE.fullmatch(candidate):
+        return candidate
+    return fallback
 
-    def do_POST(self) -> None:
-        parsed = urlparse(self.path)
-        query = parse_qs(parsed.query)
-        if parsed.path.startswith(ACTION_ROUTE_PREFIX):
-            if not _stats_request_is_authorized(self, query):
-                _send_bytes(
-                    self,
-                    403,
-                    _unauthorized_stats_page(),
-                    content_type="text/html; charset=utf-8",
-                )
-                return
+def _get_remote_ip(request: web.Request) -> str:
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        ip = forwarded.split(",")[0].strip()
+        if ip:
+            return ip
+    return request.remote or ""
 
-            action_key = unquote(parsed.path[len(ACTION_ROUTE_PREFIX) :]).strip().strip("/")
-            auth_query = _auth_query_pairs(query)
-            if action_key == "delete-blocked-users":
-                if DB_PATH.exists():
-                    with sqlite3.connect(DB_PATH, timeout=5, check_same_thread=False) as conn:
-                        conn.execute("DELETE FROM users WHERE COALESCE(is_blocked, 0) = 1")
-                        conn.commit()
-                _cache["payload"] = None
-                _redirect(self, _build_detail_href("blocked-users", auth_query))
-                return
-
-            self.send_error(404, "Not Found")
-            return
-
-        if parsed.path != "/auth-bootstrap":
-            self.send_error(404, "Not Found")
-            return
-
-        content_type = (
-            (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
-        )
-        if content_type and content_type != "application/json":
-            _send_json(self, 415, {"error": "Faqat JSON so'rov qabul qilinadi."})
-            return
-
-        try:
-            content_length = int((self.headers.get("Content-Length") or "0").strip())
-        except ValueError:
-            _send_json(self, 400, {"error": "So'rov uzunligi noto'g'ri."})
-            return
-
-        if content_length <= 0 or content_length > 32_768:
-            _send_json(self, 400, {"error": "So'rov formati noto'g'ri."})
-            return
-
-        raw_body = self.rfile.read(content_length)
-        try:
-            payload = json.loads(raw_body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            _send_json(self, 400, {"error": "JSON formati noto'g'ri."})
-            return
-
-        if not isinstance(payload, dict):
-            _send_json(self, 400, {"error": "So'rov tanasi noto'g'ri."})
-            return
-
-        verified_init_data = verify_telegram_webapp_init_data(
-            str(payload.get("initData") or "")
-        )
-        if not verified_init_data:
-            _send_json(
-                self,
-                403,
-                {"error": "Telegram ruxsati tasdiqlanmadi. Statistika tugmasini qayta bosing."},
-            )
-            return
-
-        user_id = int(verified_init_data.get("user_id") or 0)
-        if not _is_stats_operator(user_id):
-            _send_json(
-                self,
-                403,
-                {"error": "Sizda statistika panelini ochish ruxsati yo'q."},
-            )
-            return
-
-        signed_url = build_signed_stats_webapp_url(
-            _stats_base_url_for_request(self),
-            user_id,
-        )
-        _send_json(self, 200, {"ok": True, "url": signed_url})
-
-    def do_GET(self) -> None:
-        parsed = urlparse(self.path)
-        path = parsed.path
-        query = parse_qs(parsed.query)
-
-        if path.startswith(SHARE_MEDIA_ROUTE_PREFIX):
-            code = unquote(path[len(SHARE_MEDIA_ROUTE_PREFIX) :]).strip().strip("/")
-            if not code:
-                self.send_error(404, "Not Found")
-                return
-            if not _share_request_is_authorized(code, query, media=True):
-                _send_bytes(
-                    self,
-                    403,
-                    _unauthorized_share_page(),
-                    content_type="text/html; charset=utf-8",
-                )
-                return
-            _stream_share_media(self, code)
-            return
-
-        if path.startswith("/share/"):
-            code = unquote(path[len("/share/") :]).strip().strip("/")
-            if not code:
-                self.send_error(404, "Not Found")
-                return
-            if not _share_request_is_authorized(code, query):
-                _send_bytes(
-                    self,
-                    403,
-                    _unauthorized_share_page(),
-                    content_type="text/html; charset=utf-8",
-                )
-                return
-
-            target = _safe_target_url((query.get("target") or [""])[0])
-            public_base = urlsplit(_stats_base_url_for_request(self))
-            host = public_base.netloc or _request_host(self, fallback="localhost")
-            scheme = public_base.scheme or _request_scheme(self)
-            has_preview_media = _resolve_share_media_source(code) is not None
-            media_url = None
-            if has_preview_media:
-                media_signature = build_signed_share_query(code, media=True)
-                if media_signature:
-                    media_url = (
-                        f"{scheme}://{host}{SHARE_MEDIA_ROUTE_PREFIX}"
-                        f"{quote(code, safe='')}?{urlencode(media_signature)}"
-                    )
-            body = _build_share_page(
-                code=code,
-                request_host=host,
-                request_path=path,
-                target_url=target,
-                media_url=media_url,
-            )
-            _send_bytes(self, 200, body, content_type="text/html; charset=utf-8")
-            return
-
-        if path.startswith(DETAIL_ROUTE_PREFIX):
-            if not _stats_request_is_authorized(self, query):
-                body = (
-                    _unauthorized_stats_page()
-                    if _is_local_stats_request(self)
-                    else _stats_auth_bootstrap_page()
-                )
-                _send_bytes(
-                    self,
-                    403 if _is_local_stats_request(self) else 200,
-                    body,
-                    content_type="text/html; charset=utf-8",
-                )
-                return
-
-            metric_key = unquote(path[len(DETAIL_ROUTE_PREFIX) :]).strip().strip("/")
-            body_text = _build_detail_page(metric_key, query)
-            if body_text is None:
-                self.send_error(404, "Not Found")
-                return
-            _send_bytes(
-                self,
-                200,
-                body_text.encode("utf-8"),
-                content_type="text/html; charset=utf-8",
-            )
-            return
-
-        if path not in {"/", "/index.html"}:
-            self.send_error(404, "Not Found")
-            return
-
-        if not _stats_request_is_authorized(self, query):
-            body = (
-                _unauthorized_stats_page()
-                if _is_local_stats_request(self)
-                else _stats_auth_bootstrap_page()
-            )
-            _send_bytes(
-                self,
-                403 if _is_local_stats_request(self) else 200,
-                body,
-                content_type="text/html; charset=utf-8",
-            )
-            return
-
-        global _cache
-        current_time = time.time()
-        payload = _cache.get("payload")
-        if payload is None or current_time - _cache["timestamp"] > CACHE_TTL:
-            payload = _query_dashboard_payload()
-            _cache["payload"] = payload
-            _cache["timestamp"] = current_time
-
-        body = _build_dashboard_page(_auth_query_pairs(query), payload).encode("utf-8")
-        _send_bytes(self, 200, body, content_type="text/html; charset=utf-8")
-
-    def log_message(self, format: str, *args: object) -> None:
-        return
-
-
-if __name__ == "__main__":
-    pid_path = Path(__file__).resolve().with_name(".webapp.pid")
-    server_address = ("0.0.0.0", PORT)
+def _is_loopback_client_aio(request: web.Request) -> bool:
+    client_host = _get_remote_ip(request).strip()
+    if not client_host:
+        return False
     try:
-        httpd = ReusableHTTPServer(server_address, SimpleHandler)
+        return ipaddress.ip_address(client_host).is_loopback
+    except ValueError:
+        return client_host.lower() == "localhost"
+
+def _is_local_host(host: str) -> bool:
+    normalized = (host or "").split(":", 1)[0].strip().strip("[]").lower()
+    return normalized in {"localhost", "127.0.0.1", "::1"}
+
+def _is_local_stats_request_aio(request: web.Request) -> bool:
+    host = _get_host_from_request(request, fallback="127.0.0.1")
+    return _is_loopback_client_aio(request) and _is_local_host(host)
+
+def _request_scheme_aio(request: web.Request) -> str:
+    forwarded_proto = (request.headers.get("X-Forwarded-Proto") or "").split(",", 1)[0].strip().lower()
+    if forwarded_proto in {"http", "https"}:
+        return forwarded_proto
+    return "http" if _is_local_stats_request_aio(request) else "https"
+
+def _configured_stats_base_url() -> str:
+    raw_url = get_stats_webapp_url()
+    if raw_url.startswith("https://"):
+        return raw_url
+    return ""
+
+def _stats_base_url_for_request_aio(request: web.Request) -> str:
+    configured_url = _configured_stats_base_url()
+    if configured_url:
+        return configured_url
+    host = _get_host_from_request(request, fallback=f"127.0.0.1:{PORT}")
+    return f"{_request_scheme_aio(request)}://{host}/"
+
+def _get_query_dict(request: web.Request) -> dict[str, list[str]]:
+    # aiohttp request.query is MultiDict, getall for each key
+    qdict: dict[str, list[str]] = {}
+    for key in request.query:
+        qdict[key] = request.query.getall(key)
+    return qdict
+
+def _query_value(query: dict[str, list[str]], key: str) -> str:
+    values = query.get(key) or []
+    if not values:
+        return ""
+    return str(values[0]).strip()
+
+def _is_stats_operator_sync(user_id: int) -> bool:
+    if int(user_id) == int(ADMIN_ID):
+        return True
+    if user_id <= 0 or not DB_PATH.exists():
+        return False
+    with sqlite3.connect(DB_PATH, timeout=5, check_same_thread=False) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM helper_admins WHERE user_id = ? LIMIT 1",
+            (int(user_id),),
+        ).fetchone()
+    return row is not None
+
+def _stats_request_is_authorized_aio(request: web.Request, query: dict[str, list[str]]) -> bool:
+    if _is_local_stats_request_aio(request):
+        return True
+    if not verify_signed_stats_webapp_request(query):
+        return False
+    try:
+        signed_user_id = int(_query_value(query, "uid"))
+    except ValueError:
+        return False
+    return _is_stats_operator_sync(signed_user_id)
+
+def _share_request_is_authorized(code: str, query: dict[str, list[str]], *, media: bool = False) -> bool:
+    return verify_signed_share_request(code, query, media=media)
+
+def _content_security_policy() -> str:
+    return "; ".join(
+        [
+            "default-src 'self'",
+            "script-src 'self' 'unsafe-inline' https://telegram.org",
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+            "font-src 'self' https://fonts.gstatic.com data:",
+            "img-src 'self' data: https:",
+            "media-src 'self' https://api.telegram.org blob:",
+            "connect-src 'self' https://telegram.org https://*.telegram.org",
+            "base-uri 'self'",
+            "form-action 'self'",
+            "object-src 'none'",
+            "frame-ancestors 'self' https://web.telegram.org https://*.telegram.org https://t.me",
+        ]
+    )
+
+def _common_headers(content_type: str | None = None, cache_control: str = "no-store", include_csp: bool = False) -> dict:
+    headers = {}
+    if content_type:
+        headers["Content-Type"] = content_type
+    headers["Cache-Control"] = cache_control
+    if "no-store" in cache_control.lower():
+        headers["Pragma"] = "no-cache"
+    headers["X-Content-Type-Options"] = "nosniff"
+    headers["Referrer-Policy"] = "no-referrer"
+    headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=(), payment=()"
+    headers["X-Robots-Tag"] = "noindex, nofollow"
+    if include_csp:
+        headers["Content-Security-Policy"] = _content_security_policy()
+    return headers
+
+def _unauthorized_stats_page_bytes() -> bytes:
+    return (
+        "<!doctype html>"
+        "<html lang='uz'>"
+        "<head>"
+        "<meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+        "<title>Ruxsat Yo'q</title>"
+        "<style>"
+        "body{font-family:Arial,sans-serif;background:#0f172a;color:#e2e8f0;"
+        "display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:24px;}"
+        ".card{max-width:480px;background:#111827;border:1px solid #334155;border-radius:20px;padding:28px;"
+        "box-shadow:0 20px 60px rgba(0,0,0,.35)}"
+        "h1{margin:0 0 12px;font-size:28px}p{margin:0;line-height:1.6;color:#cbd5e1}"
+        "</style>"
+        "</head>"
+        "<body><div class='card'><h1>Ruxsat yo'q</h1>"
+        "<p>Statistika havolasi eskirgan yoki noto'g'ri. Botdagi <b>Statistika</b> tugmasi orqali qayta oching.</p>"
+        "</div></body></html>"
+    ).encode("utf-8")
+
+def _unauthorized_share_page_bytes() -> bytes:
+    return (
+        "<!doctype html>"
+        "<html lang='uz'>"
+        "<head>"
+        "<meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+        "<title>Havola Eskirgan</title>"
+        "<style>"
+        "body{font-family:Arial,sans-serif;background:#0f172a;color:#e2e8f0;"
+        "display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:24px;}"
+        ".card{max-width:520px;background:#111827;border:1px solid #334155;border-radius:20px;padding:28px;"
+        "box-shadow:0 20px 60px rgba(0,0,0,.35)}"
+        "h1{margin:0 0 12px;font-size:28px}p{margin:0;line-height:1.6;color:#cbd5e1}"
+        "</style>"
+        "</head>"
+        "<body><div class='card'><h1>Havola eskirgan</h1>"
+        "<p>Ulashish havolasi muddati tugagan yoki noto'g'ri. Kontentni bot ichidan qayta ochib, yangidan ulashing.</p>"
+        "</div></body></html>"
+    ).encode("utf-8")
+
+def _stats_auth_bootstrap_page_bytes() -> bytes:
+    return (
+        "<!doctype html>"
+        "<html lang='uz'>"
+        "<head>"
+        "<meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+        "<title>Statistika ochilmoqda</title>"
+        "<script src='https://telegram.org/js/telegram-web-app.js'></script>"
+        "<style>"
+        ":root{color-scheme:dark;font-family:Arial,sans-serif;}"
+        "body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;"
+        "padding:24px;background:linear-gradient(180deg,#0f172a,#111827);color:#e2e8f0;}"
+        ".card{max-width:520px;width:100%;background:rgba(15,23,42,.86);border:1px solid #334155;"
+        "border-radius:24px;padding:28px;box-shadow:0 24px 60px rgba(0,0,0,.35)}"
+        ".badge{display:inline-flex;align-items:center;gap:10px;font-size:14px;color:#93c5fd;"
+        "margin-bottom:14px;font-weight:700;letter-spacing:.02em}"
+        ".spinner{width:18px;height:18px;border-radius:50%;border:3px solid rgba(148,163,184,.28);"
+        "border-top-color:#38bdf8;animation:spin .9s linear infinite}"
+        "h1{margin:0 0 10px;font-size:30px;color:#f8fafc}"
+        "p{margin:0;line-height:1.7;color:#cbd5e1}"
+        ".hint{margin-top:16px;font-size:14px;color:#94a3b8}"
+        ".error{margin-top:16px;padding:14px 16px;border-radius:16px;background:#1e293b;color:#fecaca;"
+        "border:1px solid rgba(248,113,113,.28);display:none}"
+        "@keyframes spin{to{transform:rotate(360deg)}}"
+        "</style>"
+        "</head>"
+        "<body>"
+        "<div class='card'>"
+        "<div class='badge'><span class='spinner' id='spinner'></span> Telegram tekshiruvi</div>"
+        "<h1>Statistika ochilmoqda</h1>"
+        "<p id='status'>Sizning ruxsatingiz tekshirilmoqda. Bir necha soniyadan keyin panel ochiladi.</p>"
+        "<div class='hint' id='hint'>Agar oynani oddiy brauzerda ochgan bo'lsangiz, botdagi <b>Statistika</b> tugmasidan qayta kiring.</div>"
+        "<div class='error' id='error'></div>"
+        "</div>"
+        "<script>"
+        "(async function(){"
+        "const statusEl=document.getElementById('status');"
+        "const hintEl=document.getElementById('hint');"
+        "const errorEl=document.getElementById('error');"
+        "const spinnerEl=document.getElementById('spinner');"
+        "const fail=(message)=>{statusEl.textContent='Ruxsat tasdiqlanmadi';"
+        "errorEl.textContent=message;errorEl.style.display='block';spinnerEl.style.display='none';};"
+        "const tg=window.Telegram&&window.Telegram.WebApp;"
+        "if(!tg){fail('Sahifa Telegram ichida ochilmadi. Botdagi Statistika tugmasi orqali qayta oching.');return;}"
+        "try{tg.ready();tg.expand();}catch(_err){}"
+        "const initData=(tg.initData||'').trim();"
+        "if(!initData){fail('Telegram ruxsat ma\\'lumoti topilmadi. Statistika tugmasini qayta bosing.');return;}"
+        "hintEl.textContent='Ruxsat tasdiqlanmoqda, oynani yopmang.';"
+        "try{"
+        "const response=await fetch('/auth-bootstrap',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({initData:initData})});"
+        "const payload=await response.json().catch(()=>({}));"
+        "if(!response.ok||!payload.url){throw new Error(payload.error||'Ruxsatni tekshirib bo\\'lmadi.');}"
+        "window.location.replace(payload.url);"
+        "}catch(error){"
+        "fail((error&&error.message)||'Statistika panelini ochib bo\\'lmadi.');"
+        "}"
+        "})();"
+        "</script>"
+        "</body>"
+        "</html>"
+    ).encode("utf-8")
+
+# ===== Telegram file resolving (async) =====
+
+_share_media_cache: dict[str, tuple[float, str, str]] = {}
+_share_media_miss_cache: dict[str, float] = {}
+
+def _mime_type_from_file_path(file_path: str) -> str:
+    lowered = (file_path or "").lower()
+    if lowered.endswith(".mp4"):
+        return "video/mp4"
+    if lowered.endswith(".mkv"):
+        return "video/x-matroska"
+    if lowered.endswith(".mov"):
+        return "video/quicktime"
+    if lowered.endswith(".webm"):
+        return "video/webm"
+    if lowered.endswith(".avi"):
+        return "video/x-msvideo"
+    if lowered.endswith(".m4v"):
+        return "video/mp4"
+    return "application/octet-stream"
+
+async def _resolve_telegram_media_url_async(file_id: str) -> tuple[str, str] | None:
+    normalized_file_id = (file_id or "").strip()
+    if not normalized_file_id:
+        return None
+    token = (BOT_TOKEN or "").strip()
+    if not token:
+        return None
+    api_url = f"https://api.telegram.org/bot{token}/getFile?file_id={quote(normalized_file_id, safe='')}"
+    try:
+        async with ClientSession() as session:
+            async with session.get(api_url, timeout=12) as resp:
+                if resp.status != 200:
+                    return None
+                payload = await resp.json()
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        return None
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        return None
+    file_path = str(result.get("file_path") or "").strip()
+    if not file_path:
+        return None
+    download_url = f"https://api.telegram.org/file/bot{token}/{quote(file_path, safe='/._-')}"
+    return download_url, _mime_type_from_file_path(file_path)
+
+async def _resolve_share_media_source_async(code: str) -> tuple[str, str] | None:
+    normalized_code = (code or "").strip()
+    if not normalized_code:
+        return None
+    now = time.time()
+    miss_ts = _share_media_miss_cache.get(normalized_code)
+    if miss_ts is not None and now - miss_ts <= SHARE_MEDIA_CACHE_TTL:
+        return None
+    cached = _share_media_cache.get(normalized_code)
+    if cached is not None and now - cached[0] <= SHARE_MEDIA_CACHE_TTL:
+        return cached[1], cached[2]
+
+    # DB query needs to be in thread
+    def _query_file_id():
+        return _query_share_media_file_id(normalized_code)
+
+    file_id = await asyncio.to_thread(_query_file_id)
+    if not file_id:
+        _share_media_cache.pop(normalized_code, None)
+        _share_media_miss_cache[normalized_code] = now
+        return None
+
+    resolved = await _resolve_telegram_media_url_async(file_id)
+    if resolved is None:
+        _share_media_cache.pop(normalized_code, None)
+        _share_media_miss_cache[normalized_code] = now
+        return None
+
+    download_url, mime_type = resolved
+    _share_media_cache[normalized_code] = (now, download_url, mime_type)
+    _share_media_miss_cache.pop(normalized_code, None)
+    return download_url, mime_type
+
+# ========== AIOHTTP HANDLERS ==========
+
+async def dashboard_handler(request: web.Request) -> web.Response:
+    query = _get_query_dict(request)
+    is_authorized = await asyncio.to_thread(_stats_request_is_authorized_aio, request, query)
+    if not is_authorized:
+        is_local = _is_local_stats_request_aio(request)
+        if is_local:
+            body = _unauthorized_stats_page_bytes()
+            headers = _common_headers(content_type="text/html; charset=utf-8", cache_control="no-store", include_csp=True)
+            return web.Response(body=body, status=403, headers=headers)
+        else:
+            body = _stats_auth_bootstrap_page_bytes()
+            headers = _common_headers(content_type="text/html; charset=utf-8", cache_control="no-store", include_csp=True)
+            return web.Response(body=body, status=200, headers=headers)
+
+    # Cache handling
+    global _cache
+    current_time = time.time()
+    payload = _cache.get("payload")
+    if payload is None or current_time - _cache["timestamp"] > CACHE_TTL:
+        payload = await asyncio.to_thread(_query_dashboard_payload)
+        _cache["payload"] = payload
+        _cache["timestamp"] = current_time
+
+    auth_pairs = _auth_query_pairs(query)
+    body_text = await asyncio.to_thread(_build_dashboard_page, auth_pairs, payload)
+    body = body_text.encode("utf-8")
+    headers = _common_headers(content_type="text/html; charset=utf-8", cache_control="no-store", include_csp=True)
+    return web.Response(body=body, status=200, headers=headers)
+
+async def detail_handler(request: web.Request) -> web.Response:
+    query = _get_query_dict(request)
+    is_authorized = await asyncio.to_thread(_stats_request_is_authorized_aio, request, query)
+    if not is_authorized:
+        is_local = _is_local_stats_request_aio(request)
+        body = _unauthorized_stats_page_bytes() if is_local else _stats_auth_bootstrap_page_bytes()
+        status = 403 if is_local else 200
+        headers = _common_headers(content_type="text/html; charset=utf-8", cache_control="no-store", include_csp=True)
+        return web.Response(body=body, status=status, headers=headers)
+
+    metric_key = request.match_info.get("metric", "").strip().strip("/")
+    metric_key = unquote(metric_key)
+    body_text = await asyncio.to_thread(_build_detail_page, metric_key, query)
+    if body_text is None:
+        raise web.HTTPNotFound()
+    body = body_text.encode("utf-8")
+    headers = _common_headers(content_type="text/html; charset=utf-8", cache_control="no-store", include_csp=True)
+    return web.Response(body=body, status=200, headers=headers)
+
+async def share_handler(request: web.Request) -> web.Response:
+    code = request.match_info.get("code", "").strip().strip("/")
+    code = unquote(code)
+    if not code:
+        raise web.HTTPNotFound()
+    query = _get_query_dict(request)
+    if not _share_request_is_authorized(code, query):
+        body = _unauthorized_share_page_bytes()
+        headers = _common_headers(content_type="text/html; charset=utf-8", cache_control="no-store", include_csp=True)
+        return web.Response(body=body, status=403, headers=headers)
+
+    target = _safe_target_url((query.get("target") or [""])[0] if query.get("target") else None)
+    # Build base url for media
+    # Need to run blocking db check for preview media in thread
+    has_preview = await asyncio.to_thread(lambda: _resolve_share_media_source(code) is not None) if ' _resolve_share_media_source' in globals() else False
+    # For async version, check async source (without actually resolving again if cached miss)
+    # We will use async resolver for media existence
+    media_source = await _resolve_share_media_source_async(code)
+    media_url = None
+    if media_source is not None:
+        # Build signed media url
+        media_sig = build_signed_share_query(code, media=True)
+        if media_sig:
+            # Determine scheme/host
+            host = _get_host_from_request(request, fallback="localhost")
+            scheme = _request_scheme_aio(request)
+            media_url = f"{scheme}://{host}{SHARE_MEDIA_ROUTE_PREFIX}{quote(code, safe='')}?{urlencode(media_sig)}"
+
+    # Need request host/path for canonical
+    public_base = urlsplit(_stats_base_url_for_request_aio(request))
+    req_host = public_base.netloc or _get_host_from_request(request, fallback="localhost")
+    req_path = request.path
+
+    # _build_share_page is sync and expects _query_share_content internally, we can call it in thread
+    def _build_page_sync():
+        return _build_share_page(code=code, request_host=req_host, request_path=req_path, target_url=target, media_url=media_url)
+
+    body = await asyncio.to_thread(_build_page_sync)
+    headers = _common_headers(content_type="text/html; charset=utf-8", cache_control="no-store", include_csp=True)
+    return web.Response(body=body, status=200, headers=headers)
+
+async def share_media_handler(request: web.Request) -> web.Response:
+    code = request.match_info.get("code", "").strip().strip("/")
+    code = unquote(code)
+    if not code:
+        raise web.HTTPNotFound()
+    query = _get_query_dict(request)
+    if not _share_request_is_authorized(code, query, media=True):
+        body = _unauthorized_share_page_bytes()
+        headers = _common_headers(content_type="text/html; charset=utf-8", cache_control="no-store", include_csp=True)
+        return web.Response(body=body, status=403, headers=headers)
+
+    source = await _resolve_share_media_source_async(code)
+    if source is None:
+        raise web.HTTPNotFound(text="Media Not Found")
+
+    download_url, fallback_mime = source
+    incoming_range = request.headers.get("Range")
+
+    # Stream from Telegram
+    try:
+        async with ClientSession() as session:
+            headers_up = {"User-Agent": "CinemaWebApp/1.0"}
+            if incoming_range:
+                headers_up["Range"] = incoming_range
+            async with session.get(download_url, headers=headers_up) as upstream:
+                status = upstream.status
+                # Prepare response headers
+                content_type = upstream.headers.get("Content-Type") or fallback_mime
+                content_length = upstream.headers.get("Content-Length")
+                content_range = upstream.headers.get("Content-Range")
+                accept_ranges = upstream.headers.get("Accept-Ranges") or "bytes"
+
+                resp_headers = _common_headers(content_type=content_type, cache_control="private, max-age=300", include_csp=False)
+                if content_length:
+                    resp_headers["Content-Length"] = content_length
+                if content_range:
+                    resp_headers["Content-Range"] = content_range
+                if accept_ranges:
+                    resp_headers["Accept-Ranges"] = accept_ranges
+
+                # For streaming, use StreamResponse
+                resp = StreamResponse(status=status, headers=resp_headers)
+                await resp.prepare(request)
+
+                async for chunk in upstream.content.iter_chunked(64*1024):
+                    if not chunk:
+                        break
+                    try:
+                        await resp.write(chunk)
+                    except (ConnectionResetError, BrokenPipeError, OSError):
+                        break
+                try:
+                    await resp.write_eof()
+                except:
+                    pass
+                return resp
+    except web.HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Media proxy error: %s", e)
+        raise web.HTTPBadGateway(text="Media Proxy Error")
+
+async def auth_bootstrap_handler(request: web.Request) -> web.Response:
+    # Only JSON
+    content_type = (request.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    if content_type and content_type != "application/json":
+        return web.json_response({"error": "Faqat JSON so'rov qabul qilinadi."}, status=415)
+
+    try:
+        body_bytes = await request.read()
+        if len(body_bytes) == 0 or len(body_bytes) > 32768:
+            return web.json_response({"error": "So'rov formati noto'g'ri."}, status=400)
+        payload = json.loads(body_bytes.decode("utf-8"))
+    except Exception:
+        return web.json_response({"error": "JSON formati noto'g'ri."}, status=400)
+
+    if not isinstance(payload, dict):
+        return web.json_response({"error": "So'rov tanasi noto'g'ri."}, status=400)
+
+    verified = verify_telegram_webapp_init_data(str(payload.get("initData") or ""))
+    if not verified:
+        return web.json_response({"error": "Telegram ruxsati tasdiqlanmadi. Statistika tugmasini qayta bosing."}, status=403)
+
+    user_id = int(verified.get("user_id") or 0)
+    is_operator = await asyncio.to_thread(_is_stats_operator_sync, user_id)
+    if not is_operator:
+        return web.json_response({"error": "Sizda statistika panelini ochish ruxsati yo'q."}, status=403)
+
+    base_url = _stats_base_url_for_request_aio(request)
+    signed_url = build_signed_stats_webapp_url(base_url, user_id)
+    return web.json_response({"ok": True, "url": signed_url}, status=200)
+
+async def action_handler(request: web.Request) -> web.Response:
+    query = _get_query_dict(request)
+    is_authorized = await asyncio.to_thread(_stats_request_is_authorized_aio, request, query)
+    if not is_authorized:
+        body = _unauthorized_stats_page_bytes()
+        headers = _common_headers(content_type="text/html; charset=utf-8", cache_control="no-store", include_csp=True)
+        return web.Response(body=body, status=403, headers=headers)
+
+    action_key = request.match_info.get("action", "").strip().strip("/")
+    action_key = unquote(action_key)
+    auth_pairs = _auth_query_pairs(query)
+
+    if action_key == "delete-blocked-users":
+        def _delete_blocked():
+            if DB_PATH.exists():
+                with sqlite3.connect(DB_PATH, timeout=5, check_same_thread=False) as conn:
+                    conn.execute("DELETE FROM users WHERE COALESCE(is_blocked, 0) = 1")
+                    conn.commit()
+        await asyncio.to_thread(_delete_blocked)
+        global _cache
+        _cache["payload"] = None
+        location = _build_detail_href("blocked-users", auth_pairs)
+        # 303 See Other
+        raise web.HTTPSeeOther(location=location)
+
+    raise web.HTTPNotFound()
+
+def create_app() -> web.Application:
+    app = web.Application()
+    app.router.add_get("/", dashboard_handler)
+    app.router.add_get("/index.html", dashboard_handler)
+    app.router.add_get("/share/{code}", share_handler)
+    app.router.add_get(f"{SHARE_MEDIA_ROUTE_PREFIX}{{code}}", share_media_handler)
+    app.router.add_get(f"{DETAIL_ROUTE_PREFIX}{{metric:.*}}", detail_handler)
+    app.router.add_post("/auth-bootstrap", auth_bootstrap_handler)
+    app.router.add_post(f"{ACTION_ROUTE_PREFIX}{{action:.*}}", action_handler)
+    # Also support GET for actions? Original only POST, but keep both
+    app.router.add_get(f"{ACTION_ROUTE_PREFIX}{{action:.*}}", action_handler)
+    return app
+
+async def run_app_async():
+    pid_path = Path(__file__).resolve().with_name(".webapp.pid")
+    app = create_app()
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    try:
+        await site.start()
     except OSError as exc:
-        print(
-            f"Web app porti band yoki serverni ochib bo'lmadi ({server_address[1]}): {exc}",
-            file=sys.stderr,
-        )
+        print(f"Web app porti band yoki serverni ochib bo'lmadi ({PORT}): {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
 
     try:
         pid_path.write_text(str(os.getpid()), encoding="utf-8")
-        print(
-            f"Web app server running on http://{server_address[0]}:{server_address[1]}"
-        )
-        print(
-            "Expose this address with a tunnel and use the HTTPS URL as STATS_WEBAPP_URL."
-        )
-        httpd.serve_forever()
+        print(f"Web app server running on http://0.0.0.0:{PORT} (async aiohttp)")
+        print("Expose this address with a tunnel and use the HTTPS URL as STATS_WEBAPP_URL.")
+        # Keep running forever
+        while True:
+            await asyncio.sleep(3600)
     finally:
-        with suppress(OSError):
-            httpd.server_close()
+        await runner.cleanup()
         with suppress(OSError):
             pid_path.unlink()
+
+if __name__ == "__main__":
+    asyncio.run(run_app_async())
+
