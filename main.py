@@ -112,33 +112,128 @@ def setup_logging() -> None:
     logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 
 
+async def _verify_database_integrity(db_path: Path) -> dict[str, int]:
+    """Verify database integrity and get table row counts.
+
+    Returns dict of table names to row counts.
+    Raises RuntimeError if integrity check fails.
+    """
+    import sqlite3
+
+    counts = {}
+    try:
+        with sqlite3.connect(str(db_path), timeout=5) as conn:
+            # Check database integrity
+            result = conn.execute("PRAGMA integrity_check").fetchone()
+            if result and result[0] != 'ok':
+                raise RuntimeError(f"Integrity check failed: {result[0]}")
+
+            # Count rows in all important tables
+            tables = [
+                "users", "movies", "serial_groups", "favorites", "history",
+                "requests", "ads", "helper_admins", "sponsor_channels",
+                "content_view_events", "user_search_events", "feature_trials",
+                "ad_deliveries", "movie_views"
+            ]
+
+            for table in tables:
+                try:
+                    row = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+                    counts[table] = row[0] if row else 0
+                except sqlite3.OperationalError:
+                    # Table doesn't exist yet
+                    counts[table] = 0
+
+    except Exception as e:
+        raise RuntimeError(f"Failed to verify database at {db_path}: {e}")
+
+    return counts
+
+
 async def migrate_to_persistent_volume() -> None:
-    """One-time migration: copy old database to new persistent Volume location."""
-    import shutil
+    """One-time migration using SQLite VACUUM INTO (transaction-safe).
+
+    This method:
+    - Checkpoints WAL to main database file
+    - Creates transaction-consistent backup with VACUUM INTO
+    - Verifies integrity of destination database
+    - Compares row counts before/after to detect data loss
+    - Only runs if old database exists and new database doesn't
+    """
+    import sqlite3
 
     logger = logging.getLogger(__name__)
     old_db_path = Path("/app/movies.db")
     new_db_path = Path("/app/data/movies.db")
 
-    # If old DB exists and new doesn't, migrate it
-    if old_db_path.exists() and not new_db_path.exists():
-        logger.info("Migrating database from %s to %s", old_db_path, new_db_path)
-        try:
-            shutil.copy2(old_db_path, new_db_path)
-            # Also copy WAL/SHM sidecar files if they exist
-            for suffix in ["-wal", "-shm"]:
-                old_sidecar = old_db_path.with_name(f"{old_db_path.name}{suffix}")
-                new_sidecar = new_db_path.with_name(f"{new_db_path.name}{suffix}")
-                if old_sidecar.exists():
-                    shutil.copy2(old_sidecar, new_sidecar)
-            logger.info("Database migration completed successfully")
-        except Exception as e:
-            logger.error("Database migration failed: %s", e)
-            raise
-    elif new_db_path.exists():
+    if not old_db_path.exists():
+        logger.info("No old database found at %s, new database will be created at %s",
+                   old_db_path, new_db_path)
+        return
+
+    if new_db_path.exists():
         logger.info("New database already exists at %s, skipping migration", new_db_path)
-    else:
-        logger.info("No old database found, new database will be created at %s", new_db_path)
+        return
+
+    logger.info("=== DATABASE MIGRATION START ===")
+    logger.info("Source: %s", old_db_path)
+    logger.info("Destination: %s", new_db_path)
+
+    try:
+        # Get baseline counts from source before migration
+        logger.info("Taking baseline counts from source database...")
+        source_counts = await _verify_database_integrity(old_db_path)
+        logger.info("Source database row counts: %s", source_counts)
+
+        # Perform safe backup using VACUUM INTO
+        logger.info("Starting SQLite VACUUM INTO backup...")
+        with sqlite3.connect(str(old_db_path), timeout=30) as source_conn:
+            # Checkpoint WAL: merge all committed transactions into main database file
+            # RESTART mode truncates WAL file after checkpoint
+            logger.info("Checkpointing WAL to main database file...")
+            result = source_conn.execute("PRAGMA wal_checkpoint(RESTART)")
+            wal_status = result.fetchone()
+            logger.info("WAL checkpoint result: busy=%s, log_pages=%s, checkpoint_pages=%s",
+                       wal_status[0], wal_status[1], wal_status[2])
+
+            # Create transaction-consistent backup to new location
+            # VACUUM INTO is atomic and consistent
+            logger.info("Creating backup with VACUUM INTO...")
+            source_conn.execute(f"VACUUM INTO '{new_db_path}'")
+
+        logger.info("VACUUM INTO backup completed")
+
+        # Verify destination database integrity
+        logger.info("Verifying destination database integrity...")
+        dest_counts = await _verify_database_integrity(new_db_path)
+        logger.info("Destination database row counts: %s", dest_counts)
+
+        # Compare row counts - fail if any mismatch
+        logger.info("Comparing row counts between source and destination...")
+        mismatches = []
+        for table, source_count in source_counts.items():
+            dest_count = dest_counts.get(table, 0)
+            if source_count != dest_count:
+                mismatch_msg = f"{table}: {source_count} -> {dest_count}"
+                mismatches.append(mismatch_msg)
+                logger.error("DATA LOSS DETECTED: %s", mismatch_msg)
+
+        if mismatches:
+            error_msg = f"Migration data loss detected: {', '.join(mismatches)}"
+            logger.error("=== DATABASE MIGRATION FAILED ===")
+            raise RuntimeError(error_msg)
+
+        logger.info("✓ All table row counts match - migration successful")
+        logger.info("=== DATABASE MIGRATION COMPLETE ===")
+
+    except RuntimeError as e:
+        logger.error("=== DATABASE MIGRATION FAILED ===")
+        logger.error("%s", e)
+        raise
+    except Exception as e:
+        logger.error("=== DATABASE MIGRATION FAILED WITH EXCEPTION ===")
+        logger.error("%s", e)
+        raise
 
 
 def create_dispatcher() -> Dispatcher:
