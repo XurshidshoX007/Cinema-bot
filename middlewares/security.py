@@ -75,8 +75,11 @@ class InputSanitizationMiddleware(BaseMiddleware):
             if len(text) > self.max_message_length:
                 text = text[:self.max_message_length]
                 # Optionally notify user? We'll just truncate silently.
-            # Update the event's text
-            event.text = text
+            # Message is a frozen pydantic model in aiogram (Pydantic 2.12+),
+            # so we can't assign to event.text directly. Create a modified
+            # copy instead and use that for downstream handlers.
+            if text != event.text:
+                event = event.model_copy(update={"text": text})
         elif isinstance(event, CallbackQuery) and event.data:
             # Callback data should be short, but we still sanitize
             data_str = event.data
@@ -84,7 +87,10 @@ class InputSanitizationMiddleware(BaseMiddleware):
             data_str = data_str.strip()
             if len(data_str) > self.max_callback_length:
                 data_str = data_str[:self.max_callback_length]
-            event.data = data_str
+            # CallbackQuery is also a frozen pydantic model, so use model_copy
+            # instead of mutating the field directly.
+            if data_str != event.data:
+                event = event.model_copy(update={"data": data_str})
 
         return await handler(event, data)
 
@@ -171,6 +177,9 @@ class CallbackSignatureMiddleware(BaseMiddleware):
         if not self.hmac.compare_digest(expected, signature):
             await event.answer("Callback imzosini tekshirib bo'lmadi", show_alert=True)
             return
-        # Optionally, we can replace event.data with just payload for handlers
-        event.data = payload
+        # Optionally, we can replace event.data with just payload for handlers.
+        # CallbackQuery is a frozen pydantic model, so we must create a copy
+        # rather than assigning to the field directly.
+        if payload != event.data:
+            event = event.model_copy(update={"data": payload})
         return await handler(event, data)
