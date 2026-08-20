@@ -111,36 +111,6 @@ class SingleInstanceLock:
 def setup_logging() -> None:
     logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 
-
-async def migrate_to_persistent_volume() -> None:
-    """One-time migration: copy old database to new persistent Volume location."""
-    import shutil
-
-    logger = logging.getLogger(__name__)
-    old_db_path = Path("/app/movies.db")
-    new_db_path = Path("/app/data/movies.db")
-
-    # If old DB exists and new doesn't, migrate it
-    if old_db_path.exists() and not new_db_path.exists():
-        logger.info("Migrating database from %s to %s", old_db_path, new_db_path)
-        try:
-            shutil.copy2(old_db_path, new_db_path)
-            # Also copy WAL/SHM sidecar files if they exist
-            for suffix in ["-wal", "-shm"]:
-                old_sidecar = old_db_path.with_name(f"{old_db_path.name}{suffix}")
-                new_sidecar = new_db_path.with_name(f"{new_db_path.name}{suffix}")
-                if old_sidecar.exists():
-                    shutil.copy2(old_sidecar, new_sidecar)
-            logger.info("Database migration completed successfully")
-        except Exception as e:
-            logger.error("Database migration failed: %s", e)
-            raise
-    elif new_db_path.exists():
-        logger.info("New database already exists at %s, skipping migration", new_db_path)
-    else:
-        logger.info("No old database found, new database will be created at %s", new_db_path)
-
-
 def create_dispatcher() -> Dispatcher:
     dispatcher = Dispatcher()
 
@@ -262,7 +232,6 @@ async def main() -> None:
     configure_process_signals(stop_event, logger)
 
     try:
-        await migrate_to_persistent_volume()
         await init_db()
         all_content = await get_all_movies()
         movie_count = sum(1 for item in all_content if item[2] == "movie")
