@@ -12,8 +12,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Database volume
-VOLUME ["/app/data"]
-ENV DB_PATH=/app/data/movies.db
-
 CMD ["python", "main.py"]
