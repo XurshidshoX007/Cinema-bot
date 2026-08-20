@@ -739,6 +739,59 @@ async def init_db() -> None:
     if "episode_number" not in movie_columns:
         await db.execute("ALTER TABLE movies ADD COLUMN episode_number INTEGER")
 
+    # FTS5 qidiruv indeksi (external-content):
+    #   - content='movies'  -> asosiy matn movies jadvalida saqlanadi, indeksda faqat tokenlar
+    #   - content_rowid='id' -> movies.id <-> movies_fts.rowid bog'lanishi
+    # Faqat title va description indekslanadi (code alohida UNIQUE indeks orqali qidiriladi).
+    async with db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='movies_fts'"
+    ) as cursor:
+        fts_table_existed = (await cursor.fetchone()) is not None
+
+    await db.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS movies_fts
+        USING fts5(
+            title,
+            description,
+            content='movies',
+            content_rowid='id',
+            tokenize='unicode61'
+        )
+        """)
+
+    # Jadval endigina yaratilgan bo'lsa — indeksni movies jadvalidan to'ldirib
+    # olamiz. Bu triggerlar yaratilishidan OLDIN bajarilishi shart: bo'sh
+    # indeks ustida 'delete' komandasi "database disk image is malformed"
+    # xatosi bilan yiqiladi (FTS5 xatti-harakati).
+    if not fts_table_existed:
+        await db.execute("INSERT INTO movies_fts(movies_fts) VALUES('rebuild')")
+
+    # movies jadvalidagi barcha o'zgarishlarni FTS indeksiga avtomatik ko'chirish.
+    # Triggersiz bu sinxronlikni har bir write funksiyada qo'lda ushlab turish kerak bo'lardi.
+    await db.execute("""
+        CREATE TRIGGER IF NOT EXISTS movies_fts_ai
+        AFTER INSERT ON movies BEGIN
+            INSERT INTO movies_fts(rowid, title, description)
+            VALUES (new.id, new.title, new.description);
+        END
+        """)
+    await db.execute("""
+        CREATE TRIGGER IF NOT EXISTS movies_fts_ad
+        AFTER DELETE ON movies BEGIN
+            INSERT INTO movies_fts(movies_fts, rowid, title, description)
+            VALUES ('delete', old.id, old.title, old.description);
+        END
+        """)
+    await db.execute("""
+        CREATE TRIGGER IF NOT EXISTS movies_fts_au
+        AFTER UPDATE ON movies BEGIN
+            INSERT INTO movies_fts(movies_fts, rowid, title, description)
+            VALUES ('delete', old.id, old.title, old.description);
+            INSERT INTO movies_fts(rowid, title, description)
+            VALUES (new.id, new.title, new.description);
+        END
+        """)
+
     async with db.execute("""
         SELECT id, title, series_title, episode_number
         FROM movies
@@ -984,6 +1037,16 @@ async def init_db() -> None:
         """,
         (now_text, now_text),
     )
+
+    # FTS5 indeksni movies bilan sinxronlash: yangi yaratilgan jadval bo'lsa,
+    # yoki sanash mos kelmasa (masalan, qo'lda o'zgartirilgan bo'lsa) — rebuild.
+    async with db.execute("SELECT COUNT(*) FROM movies") as cursor:
+        movies_total = int((await cursor.fetchone())[0] or 0)
+    async with db.execute("SELECT COUNT(*) FROM movies_fts") as cursor:
+        fts_total = int((await cursor.fetchone())[0] or 0)
+    if movies_total != fts_total:
+        await db.execute("INSERT INTO movies_fts(movies_fts) VALUES('rebuild')")
+
     await db.commit()
 
 
@@ -1848,6 +1911,49 @@ async def get_all_movies() -> list[tuple[str, str, str]]:
     ]
 
 
+# Candidate olish so'rovlarida ishlatiladigan movies ustunlari.
+# Hamma joyda `m` aliasi bilan yoziladi, chunki FTS JOIN'ida title/description
+# ustunlari movies_fts da ham bor — aliassiz query ambiguous bo'lib qoladi.
+_MOVIE_SEARCH_SELECT = """
+    m.code,
+    m.title,
+    m.description,
+    m.file_id,
+    COALESCE(m.content_kind, 'movie'),
+    m.series_title,
+    m.episode_number
+"""
+
+
+def _build_fts5_query(normalized_query: str) -> str | None:
+    """Foydalanuvchi so'rovidan xavfsiz FTS5 MATCH ifodasini quradi.
+
+    Har bir token alohida quote qilinadi va prefix belgisi (``*``) qo'shiladi,
+    masalan ``qashqirlar makoni`` -> ``"qashqirlar"* OR "makoni"*``.
+
+    Nima uchun bu xavfsiz:
+      - tokenlar faqat so'z (word) belgilaridan iborat (normalizatsiyadan o'tgan),
+      - ichidagi qo'shtirnoqlar ikki marta yozilib escape qilinadi,
+      - shuning uchun foydalanuvchi kiritgan ``"``, ``*``, ``OR``, qavslar va
+        boshqa FTS5 sintaksis belgilari so'rov tuzilishiga aralasha olmaydi.
+
+    Tokenlar 1 tadan ko'p bo'lsa, to'liq ibora (phrase) ham qo'shiladi — bu
+    bm25 reytingida aynan butun ibora mos kelgan yozuvlarni yuqoriga chiqaradi.
+    """
+    tokens = [token for token in normalized_query.split() if token]
+    if not tokens:
+        return None
+
+    def _quote(token: str) -> str:
+        return '"' + token.replace('"', '""') + '"*'
+
+    terms = [_quote(token) for token in tokens]
+    if len(tokens) > 1:
+        terms.append(_quote(" ".join(tokens)))
+
+    return " OR ".join(dict.fromkeys(terms))
+
+
 async def search_movies_by_text(
     query: str, limit: int = 50
 ) -> list[tuple[str, str, str, str]]:
@@ -1941,6 +2047,8 @@ async def search_movies_by_text(
 
         return score
 
+    # serial_groups alohida (kichik) jadval — FTS tarkibiga kirmaydi,
+    # shuning uchun uning candidate olish logikasi o'zgarishsiz qoladi.
     serial_where, serial_params = _search_where(("code", "title"))
     async with connection.execute(
         f"""
@@ -1954,25 +2062,91 @@ async def search_movies_by_text(
     ) as cursor:
         serial_rows = await cursor.fetchall()
 
-    movie_where, movie_params = _search_where(("code", "title", "series_title"))
-    async with connection.execute(
-        f"""
-        SELECT
-            code,
-            title,
-            description,
-            file_id,
-            COALESCE(content_kind, 'movie'),
-            series_title,
-            episode_number
-        FROM movies
-        WHERE {movie_where}
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (*movie_params, oversample_limit),
-    ) as cursor:
-        movie_rows = await cursor.fetchall()
+    movie_rows: list[tuple[Any, ...]] = []
+
+    # 1) Asosiy candidate olish — FTS5 MATCH (title + description).
+    #    LIKE '%query%' full-scan o'rniga FTS5 indeksidan foydalanamiz:
+    #    mavjud 909 ta filmda ham, kelajakdagi 100k+ kontentda ham tezlik
+    #    deyarli kontent hajmiga bog'liq bo'lmaydi.
+    fts_query = _build_fts5_query(normalized_query)
+    if fts_query:
+        try:
+            async with connection.execute(
+                f"""
+                SELECT {_MOVIE_SEARCH_SELECT}
+                FROM movies_fts
+                JOIN movies AS m ON m.id = movies_fts.rowid
+                WHERE movies_fts MATCH ?
+                ORDER BY movies_fts.rowid DESC
+                LIMIT ?
+                """,
+                (fts_query, oversample_limit),
+            ) as cursor:
+                movie_rows = await cursor.fetchall()
+        except aiosqlite.DatabaseError:
+            # FTS5 jadval yo'q yoki so'rov sintaksisi noto'g'ri bo'lsa
+            # (masalan, eski bazada init_db hali ishlamagan bo'lsa) —
+            # xatoni yutib, LIKE fallbackga o'tamiz.
+            logger.warning(
+                "FTS5 search failed (query=%r); using LIKE fallback",
+                raw_query,
+                exc_info=True,
+            )
+            movie_rows = []
+
+    # 2) Code bo'yicha qidiruv. Code movies_fts tarkibiga kirmaydi (faqat
+    #    title/description indekslangan), lekin movies.code da UNIQUE indeks
+    #    bor — shuning uchun aniq moslik va prefix moslik full-scan'siz,
+    #    indeks orqali tekshiriladi. GLOB ishlatiladi, chunki uning prefix
+    #    optimizatsiyasi indeksdan SEEK qiladi; LIKE esa natija topilmasa
+    #    butun jadvalni skanerlaydi (100k qatorda ~8ms farq). Xavfsizlik:
+    #    normalized_query faqat \w belgilaridan iborat (GLOB uchun maxsus
+    #    bo'lgan *, ?, [, ] belgilari _normalize_title_for_match da o'chirilgan).
+    if normalized_query:
+        async with connection.execute(
+            f"""
+            SELECT {_MOVIE_SEARCH_SELECT}
+            FROM movies AS m
+            WHERE m.code = ?
+            LIMIT 1
+            """,
+            (normalized_query,),
+        ) as cursor:
+            code_rows = await cursor.fetchall()
+
+        async with connection.execute(
+            f"""
+            SELECT {_MOVIE_SEARCH_SELECT}
+            FROM movies AS m
+            WHERE m.code GLOB ?
+            LIMIT ?
+            """,
+            (f"{normalized_query}*", oversample_limit),
+        ) as cursor:
+            code_rows.extend(await cursor.fetchall())
+
+        seen_movie_codes: set[str] = {row[0] for row in movie_rows}
+        for row in code_rows:
+            if row[0] not in seen_movie_codes:
+                movie_rows.append(row)
+                seen_movie_codes.add(row[0])
+
+    # 3) LIKE fallback: FTS ham, code lookup ham hech narsa topa olmasa,
+    #    eski to'liq LIKE qidiruv ishga tushadi (kafolat: natijalar oldingi
+    #    holatdan kamayib ketmaydi).
+    if not movie_rows:
+        movie_where, movie_params = _search_where(("code", "title", "series_title"))
+        async with connection.execute(
+            f"""
+            SELECT {_MOVIE_SEARCH_SELECT}
+            FROM movies AS m
+            WHERE {movie_where}
+            ORDER BY m.id DESC
+            LIMIT ?
+            """,
+            (*movie_params, oversample_limit),
+        ) as cursor:
+            movie_rows = await cursor.fetchall()
 
     candidates: list[tuple[int, int, str, str, str, str, str]] = []
     for code, title, description in serial_rows:
